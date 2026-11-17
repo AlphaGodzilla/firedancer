@@ -295,12 +295,14 @@ test_match( void * mem ) {
   txn->instr[ 0 ].program_id = 0U;
   FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)list_r1, 2UL )==FD_ARBFILTER_BIT_PROG_ACCOUNT );
 
-  /* R3 单独成立：列表里只有付款方与热账户，且顶层指令调用的是付款方。 */
+  /* 只有热账户命中、完全不涉及关注程序：过滤逻辑先查程序表，程序表没命中就
+     短路，热账户表一条也不探测，因此结果为 0。池账户只会被它自己的程序改
+     动，而那个程序必然出现在账户列表里，所以这类短路不会漏掉真实的池子更新。 */
   fd_acct_addr_t list_r3[ 2UL ];
   memset( list_r3, 0, sizeof(list_r3) );
   memcpy( list_r3[ 0 ].b, pad_key, 32UL );
   memcpy( list_r3[ 1 ].b, hot_key, 32UL );
-  FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)list_r3, 2UL )==FD_ARBFILTER_BIT_HOT_ACCOUNT );
+  FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)list_r3, 2UL )==0UL );
 
   /* 三条同时成立：指令直调程序表成员，它同时被记作 R2，列表里还有热账户。 */
   fd_acct_addr_t list_all[ 2UL ];
@@ -321,7 +323,8 @@ test_match( void * mem ) {
   /* 空账户列表不命中，且不会越界读。 */
   FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)unrelated, 0UL )==0UL );
 
-  /* accs 为 NULL 时改用交易线上的静态账户列表：R3 通过 payload 命中。 */
+  /* accs 为 NULL 时改用交易线上的静态账户列表。只有热账户时不命中（程序表先行
+     短路）；把账户 1 换成程序表成员后 R1/R2 成立。 */
   uchar payload[ 256UL ];
   memset( payload, 0, sizeof(payload) );
   memcpy( payload+64UL,      pad_key, 32UL );
@@ -329,7 +332,7 @@ test_match( void * mem ) {
   txn = test_txn_init( txn_mem, 1UL, 2UL );
   txn->acct_addr_off = 64U;
   txn->instr[ 0 ].program_id = 0U;
-  FD_TEST( fd_arbfilter_match( f, txn, payload, NULL, 0UL )==FD_ARBFILTER_BIT_HOT_ACCOUNT );
+  FD_TEST( fd_arbfilter_match( f, txn, payload, NULL, 0UL )==0UL );
 
   /* 线上账户列表里的程序 id 同样能让 R1 成立。 */
   memcpy( payload+64UL+32UL, prog_key, 32UL );
@@ -497,13 +500,13 @@ test_collect_commit( void * mem ) {
   FD_TEST( more==0UL );
   FD_TEST( emitted==( (1UL<<1)|(1UL<<6) ) );
 
-  /* 三个判据掩码都传 NULL 时提交集不设限：hits 等于全部命中（含只读的 [2]
-     与程序账户 [4]），位掩码与上面相同。 */
+  /* 三个判据掩码都传 NULL 时提交集不设限：hits 等于热账户表的全部命中（含只读
+     的 [2] 与没有 accdb 引用的 [5]）。程序账户 [4] 只算程序命中，不进 keys[]。 */
   hit_cnt = 0UL; more = 0UL; emitted = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 7UL,
                                NULL, NULL, NULL, 1, &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
-  FD_TEST( hit_cnt==6UL );
+  FD_TEST( hit_cnt==5UL );
   FD_TEST( emitted==( (1UL<<7)-2UL ) ); /* 索引 1..6 */
 
   /* 交易失败：什么都提交不了，hits 为空、more 为 0，位掩码照常。 */
@@ -568,12 +571,15 @@ test_collect_tags( void * mem ) {
      立），0 表示指令调用的是付款方，R1 不成立。 */
   uchar const * case_key [ 4UL ] = { prog_key[ 0 ], acct_key[ 0 ], prog_key[ 1 ], prog_key[ 2 ] };
   uchar         case_pid [ 4UL ] = { 1U, 0U, 0U, 0U };
+  /* 第 2 个用例只有热账户命中、不涉及任何关注程序，程序表先行会短路，因此位掩
+     码与命中数都是 0：这是过滤逻辑的既定语义，不是缺陷。 */
   ulong         case_bits[ 4UL ] = {
     FD_ARBFILTER_BIT_PROG_DIRECT |FD_ARBFILTER_BIT_PROG_ACCOUNT,
-    FD_ARBFILTER_BIT_HOT_ACCOUNT,
+    0UL,
     FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT,
     FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT };
-  uchar         case_tag [ 4UL ] = { 7U, 5U, 21U, 9U };
+  uchar         case_tag [ 4UL ] = { 7U, 0U, 21U, 9U };
+  ulong         case_hits[ 4UL ] = { 1UL, 0UL, 1UL, 1UL };
 
   for( int pass=0; pass<2; pass++ ) {
     /* pass 0 带 tag 安装，pass 1 不带 tag 安装。 */
@@ -592,9 +598,11 @@ test_collect_tags( void * mem ) {
                                         NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 4UL );
       FD_TEST( bits==case_bits[ c ] );
       FD_TEST( bits==fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 2UL ) );
-      FD_TEST( hit_cnt==1UL );
-      FD_TEST( hits[ 0 ].tag==( pass ? 0U : case_tag[ c ] ) );
-      FD_TEST( hits[ 1 ].tag==0xAA ); /* 有效条数之外不写 */
+      FD_TEST( hit_cnt==case_hits[ c ] );
+      if( case_hits[ c ] ) {
+        FD_TEST( hits[ 0 ].tag==( pass ? 0U : case_tag[ c ] ) );
+        FD_TEST( hits[ 1 ].tag==0xAA ); /* 有效条数之外不写 */
+      }
     }
   }
 }
@@ -674,16 +682,23 @@ test_collect_parts( void * mem ) {
   for( ulong i=0UL; i<HOT_CNT; i++ ) test_key( hot_key[ i ], 100UL+i, 113U );
   FD_TEST( fd_arbfilter_acct_set( f, HOT_CNT, (uchar const (*)[32UL])hot_key, NULL )==0 );
 
-  fd_acct_addr_t accs[ HOT_CNT+1UL ];
-  memset( accs, 0, sizeof(accs) );
-  for( ulong i=0UL; i<HOT_CNT; i++ ) memcpy( accs[ i+1UL ].b, hot_key[ i ], 32UL );
+  /* 过滤逻辑先查程序表、没命中就短路，所以这里必须放一个关注程序账户，否则
+     热账户一条也不会被探测。程序账户放在索引 1，占一个只读槽位。 */
+  uchar prog_id[ 1UL ][ 32UL ];
+  test_key( prog_id[ 0 ], 111UL, 113U );
+  FD_TEST( fd_arbfilter_prog_set( f, 1UL, (uchar const (*)[32UL])prog_id, NULL )==0 );
 
-  uchar all_set[ HOT_CNT+1UL ];
+  fd_acct_addr_t accs[ HOT_CNT+2UL ];
+  memset( accs, 0, sizeof(accs) );
+  memcpy( accs[ 1 ].b, prog_id[ 0 ], 32UL );
+  for( ulong i=0UL; i<HOT_CNT; i++ ) memcpy( accs[ i+2UL ].b, hot_key[ i ], 32UL );
+
+  uchar all_set[ HOT_CNT+2UL ];
   memset( all_set, 1, sizeof(all_set) );
 
   uchar txn_mem[ 512UL ] __attribute__((aligned(alignof(fd_txn_t))));
-  fd_txn_t * txn = test_txn_init( txn_mem, 1UL, HOT_CNT+1UL );
-  txn->instr[ 0 ].program_id = 0U; /* 付款方不在程序表里 */
+  fd_txn_t * txn = test_txn_init( txn_mem, 1UL, HOT_CNT+2UL );
+  txn->instr[ 0 ].program_id = 0U; /* 付款方不在程序表里；程序账户靠 R2 命中 */
 
   fd_arbfilter_hit_t hits[ FD_ARBNOTIFY_KEY_MAX ];
   ulong hit_cnt = 0UL;
@@ -694,10 +709,10 @@ test_collect_parts( void * mem ) {
   ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+1UL,
                                      all_set, all_set, all_set, 1,
                                      &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
-  FD_TEST( bits==FD_ARBFILTER_BIT_HOT_ACCOUNT );
+  FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( more==1UL );
-  FD_TEST( emitted==( (1UL<<(FD_ARBNOTIFY_KEY_MAX+1UL))-2UL ) ); /* 索引 1..8 */
+  FD_TEST( emitted==( ( (1UL<<(FD_ARBNOTIFY_KEY_MAX+1UL))-1UL )<<1 ) ); /* 索引 2..9 */
 
   ulong seen = 0UL; /* 第 k 位表示 hot_key[k] 已经出现在某一片里 */
   for( ulong i=0UL; i<hit_cnt; i++ ) {
@@ -714,10 +729,10 @@ test_collect_parts( void * mem ) {
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+1UL,
                                all_set, all_set, all_set, 1,
                                &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
-  FD_TEST( bits==FD_ARBFILTER_BIT_HOT_ACCOUNT );
+  FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==HOT_CNT-FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( more==0UL );
-  FD_TEST( emitted==( (1UL<<(HOT_CNT+1UL))-2UL ) ); /* 索引 1..10 */
+  FD_TEST( emitted==( ( (1UL<<(HOT_CNT+2UL))-1UL )&~(1UL) ) ); /* 索引 1..11 */
 
   for( ulong i=0UL; i<hit_cnt; i++ ) {
     ulong k = test_key_find( (uchar const (*)[32UL])hot_key, HOT_CNT, hits[ i ].key );

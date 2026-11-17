@@ -335,9 +335,22 @@ arbfilter_prog_tag_add( uchar * tags,
    fd_arbfilter_match 完全一致）：
 
      R1（PROG_DIRECT）：某条指令调用的程序在程序集合中；
-     R2（PROG_ACCOUNT）：程序集合中的某个程序出现在账户列表里，即该
+     R2（PROG_ACCOUNT）：程序集合中的某个程序出现在静态账户列表里，即该
                          交易对 DEX 程序发起了 CPI（跨程序调用）；
-     R3（HOT_ACCOUNT）：  账户列表中有热池账户。
+     R3（HOT_ACCOUNT）：  热账户表命中一个会被提交进 bank 的账户。
+
+   判定分三段，顺序即短路顺序：
+     1. 先遍历指令的 program_id 查程序表（R1）。program_id 是静态账户列表的
+        下标，因此这一步不碰账户表。
+     2. 再扫静态账户区间查程序表（R2）。CPI 内嵌调用的程序不会出现在顶层指令
+        里，只能靠它被列进账户来发现，所以这一遍不能省。
+     3. 前两段都没命中任何关注程序时**立即返回 0**，热账户表一条也不探测。池
+        账户只会被它自己的程序改动，而那个程序必然出现在账户列表里（即第 2 段
+        已命中），所以这个短路不会漏掉真实的池子更新。命中程序之后，只对满足
+        提交判据的账户探测热账户表（R3），不对全部账户做哈希探测。
+
+   由此，只有热账户变动、完全不涉及关注程序的交易**不算命中**（返回 0）：
+   这是「程序表先行」的直接结果，也是热路径上最省的一种取舍。
 
    txn 是解析后的交易，payload 是交易的线上字节。accs 是该交易已解析
    的账户 key 列表（静态 key 加上地址查找表解析出的 key），按 32 字节
@@ -391,15 +404,21 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
     acc_cnt = (ulong)txn->acct_addr_cnt;
   }
 
+  /* accs 是解析后的账户列表：前 acct_addr_cnt 条是交易自带的静态 key，地址
+     查找表加载出来的 key 排在后面。program_id 是静态 key 的下标，因此程序表
+     的探测只需要扫静态区间。 */
+  ulong static_cnt = fd_ulong_min( (ulong)txn->acct_addr_cnt, acc_cnt );
+
   ulong bits = 0UL;
   ulong cnt  = 0UL;
   if( hits && more ) *more = 0UL; /* 纯判定（hits 为 NULL）时不写调用方的变量 */
   if( prog_tag_cnt ) *prog_tag_cnt = 0UL;
 
-  /* R1：程序通过账户数组下标直接给出。 */
+  /* 第一遍：指令直调的程序（R1）。program_id 直接给出账户下标，不必扫账户
+     表。命中后把该程序表项的 tag 记进 prog_tag。 */
   for( ulong i=0UL; i<(ulong)txn->instr_cnt; i++ ) {
     ulong prog_idx = (ulong)txn->instr[ i ].program_id;
-    if( FD_UNLIKELY( prog_idx>=acc_cnt ) ) continue; /* 交易数据不一致 */
+    if( FD_UNLIKELY( prog_idx>=static_cnt ) ) continue; /* 交易数据不一致 */
     uchar const * key  = accs + prog_idx*FD_TXN_ACCT_ADDR_SZ;
     ulong         slot = fd_arbfilter_prog_idx( filter, key );
     if( FD_UNLIKELY( slot!=ULONG_MAX ) ) {
@@ -414,31 +433,47 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
     }
   }
 
-  /* R2/R3：对解析后的账户列表只遍历一遍。 */
-  ulong want = FD_ARBFILTER_BIT_PROG_ACCOUNT | FD_ARBFILTER_BIT_HOT_ACCOUNT;
-  for( ulong i=0UL; i<acc_cnt; i++ ) {
-    uchar const * key       = accs + i*FD_TXN_ACCT_ADDR_SZ;
-    ulong         prog_slot = fd_arbfilter_prog_idx( filter, key );
-    ulong         acct_slot = fd_arbfilter_acct_idx( filter, key );
-    int           in_prog   = prog_slot!=ULONG_MAX;
-    int           in_acct   = acct_slot!=ULONG_MAX;
-    if( FD_UNLIKELY( in_prog ) ) {
+  /* 第二遍：关注程序作为账户出现在交易里（R2）。CPI 内嵌调用的程序不会出现在
+     顶层指令里，只能靠它是否被列进账户来发现，所以这一遍不能省。同样只扫静
+     态区间：程序 key 不可能由地址查找表加载。 */
+  for( ulong i=0UL; i<static_cnt; i++ ) {
+    uchar const * key  = accs + i*FD_TXN_ACCT_ADDR_SZ;
+    ulong         slot = fd_arbfilter_prog_idx( filter, key );
+    if( FD_UNLIKELY( slot!=ULONG_MAX ) ) {
       bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
       if( FD_UNLIKELY( prog_tag_cnt && prog_tags ) )
-        arbfilter_prog_tag_add( prog_tags, prog_tag_cnt, prog_tag_cap, filter->prog[ prog_slot ].tag );
+        arbfilter_prog_tag_add( prog_tags, prog_tag_cnt, prog_tag_cap, filter->prog[ slot ].tag );
+      break;
     }
-    if( FD_UNLIKELY( in_acct ) ) bits |= FD_ARBFILTER_BIT_HOT_ACCOUNT;
-    if( FD_UNLIKELY( hits && ( in_prog || in_acct ) &&
-                     arbfilter_committable( writable, touched, acquired, commit_ok, i ) ) ) {
-      /* 两张表都命中时以热账户表的 tag 为准（池账户离套利标的更近）；它
-         的 tag 为 0 时退回程序表的 tag。tag 只在命中之后才读。 */
-      uchar tag = in_acct ? filter->acct[ acct_slot ].tag : 0U;
-      if( !tag && in_prog ) tag = filter->prog[ prog_slot ].tag;
+  }
+
+  /* 短路：两遍都没有命中任何关注程序，这笔交易与关注的程序无关，热账户表一
+     条也不必探测。绝大多数交易在这里直接返回。 */
+  if( FD_UNLIKELY( !( bits & ( FD_ARBFILTER_BIT_PROG_DIRECT | FD_ARBFILTER_BIT_PROG_ACCOUNT ) ) ) ) {
+    if( FD_LIKELY( hits ) ) *hit_cnt = 0UL;
+    return 0UL;
+  }
+
+  /* 第三遍：只在「会被提交进 bank」的账户里查热账户表。声明可写但执行期没
+     被改动、以及 bundle 里不持有 accdb 引用的账户都不会提交，对它们做哈希探
+     测纯属浪费。 */
+  for( ulong i=0UL; i<acc_cnt; i++ ) {
+    if( FD_UNLIKELY( !arbfilter_committable( writable, touched, acquired, commit_ok, i ) ) ) continue;
+
+    uchar const * key       = accs + i*FD_TXN_ACCT_ADDR_SZ;
+    ulong         acct_slot = fd_arbfilter_acct_idx( filter, key );
+    if( FD_UNLIKELY( acct_slot==ULONG_MAX ) ) continue;
+
+    bits |= FD_ARBFILTER_BIT_HOT_ACCOUNT;
+    if( FD_UNLIKELY( hits ) ) {
+      /* 两张表都命中时以热账户表的 tag 为准（池账户离套利标的更近）；它的 tag
+         为 0 时退回程序表的 tag。程序表的 tag 已经在上面记进 prog_tag，这里
+         只影响 key 自己的 tag。 */
+      ulong prog_slot = fd_arbfilter_prog_idx( filter, key );
+      uchar tag       = filter->acct[ acct_slot ].tag;
+      if( FD_UNLIKELY( !tag && prog_slot!=ULONG_MAX ) ) tag = filter->prog[ prog_slot ].tag;
       arbfilter_hit_take( hits, &cnt, hits_cap, emitted, i, key, tag, more );
     }
-    /* 只有纯判定（hits 为 NULL）时才提前退出：收集 key 的调用方要拿到这
-       笔交易触到的全部关注 key，提前退出会让后面的命中丢失。 */
-    if( FD_UNLIKELY( !hits && bits==( FD_ARBFILTER_BIT_PROG_DIRECT|want ) ) ) break;
   }
 
   if( FD_LIKELY( hits ) ) *hit_cnt = cnt;
