@@ -85,9 +85,18 @@ arb_print_filter( fd_arbfilter_shmem_t const * filter ) {
     printf( "  [%lu] %s\n", i, acct_b58 );
   }
 
-  printf( "stat_emit %lu\n", FD_VOLATILE_CONST( filter->stat_emit ) );
-  printf( "stat_skip %lu\n", FD_VOLATILE_CONST( filter->stat_skip ) );
+  /* 四个计数器分成两组看：stat_emit / stat_skip 按交易互斥累加，恒有
+     stat_emit + stat_skip == 执行过的交易数；命中的交易再分两类，
+     stat_emit == stat_published + stat_noacct 恒成立（stat_noacct 是命中了
+     但没有任何可提交账户、因而没有发布记录的交易）。
+     stat_records 按环里实际的记录条数累加：一笔交易的命中账户超过一条记录
+     的容量时按片发布，因此 stat_records >= stat_published，两者相等说明没有
+     任何交易跨片。 */
+  printf( "stat_emit %lu\n",      FD_VOLATILE_CONST( filter->stat_emit ) );
+  printf( "stat_skip %lu\n",      FD_VOLATILE_CONST( filter->stat_skip ) );
   printf( "stat_published %lu\n", FD_VOLATILE_CONST( filter->stat_published ) );
+  printf( "stat_noacct %lu\n",    FD_VOLATILE_CONST( filter->stat_noacct ) );
+  printf( "stat_records %lu\n",   FD_VOLATILE_CONST( filter->stat_records ) );
 }
 
 static void
@@ -367,8 +376,11 @@ arb_watch_print( arb_accdb_ro_t *       ro,
                  fd_arbnotify_t const * rec,
                  ulong                  key_idx ) {
   FD_BASE58_ENCODE_32_BYTES( rec->keys[ key_idx ], key_b58 );
-  printf( "slot=%lu bank=%lu fork=%u bits=0x%x key=%s",
-          rec->slot, rec->bank_seq, (uint)rec->accdb_fork_id, (uint)rec->matched, key_b58 );
+  /* part/more 指出这条记录是同一笔交易的第几片、后面还有没有片：可提交
+     命中超过一条记录的容量时一笔交易会占多条记录，读者不能当成重复记录。 */
+  printf( "slot=%lu bank=%lu fork=%u part=%u more=%u bits=0x%x key=%s",
+          rec->slot, rec->bank_seq, (uint)rec->accdb_fork_id,
+          (uint)rec->part, (uint)rec->more, (uint)rec->matched, key_b58 );
 
   if( arb_watch_keys_only ) { printf( "\n" ); return; }
 

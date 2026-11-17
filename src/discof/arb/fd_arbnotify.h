@@ -13,19 +13,22 @@
    环是不可靠的：没有消费者就没有流控，生产者不会因为读者跟不上而阻塞，
    读者落后时只能跳过陈旧记录（见 `arb watch`）。 */
 
-/* FD_ARBNOTIFY_KEY_MAX 是一条记录最多携带的命中 key 条数。命中的 key 多
-   于这个数时按判定顺序截断，matched 位掩码仍然完整。 */
+/* FD_ARBNOTIFY_KEY_MAX 是一条记录最多携带的命中 key 条数。同一笔交易的可
+   提交命中多于这个数时按片发布（见 part/more），命中不丢失；matched 位掩
+   码始终完整。 */
 
-#define FD_ARBNOTIFY_KEY_MAX (8UL)
+#define FD_ARBNOTIFY_KEY_MAX (9UL)
 
 struct fd_arbnotify {
   ulong  slot;             /* 交易所在 slot */
   ulong  bank_seq;         /* bank 序号，同一 slot 内排序用 */
   ushort accdb_fork_id;    /* 该交易执行时 bank 的 accdb fork id */
   uint   accdb_generation; /* 该 fork 的 generation，与 fork id 一起标识一次 fork 生命周期 */
-  ushort matched;          /* FD_ARBFILTER_BIT_* 位掩码 */
+  ushort matched;          /* FD_ARBFILTER_BIT_* 位掩码，含 readonly 命中 */
   uchar  key_cnt;          /* keys[] 中有效条数，已去重 */
-  uchar  _pad[ 3 ];
+  uchar  part;             /* 同一笔交易的第几片，从 0 起 */
+  uchar  more;             /* 1 表示该交易还有后续分片 */
+  uchar  _pad;
   uchar  sig[ 64 ];        /* 交易签名，供外部程序对账 */
   uchar  keys[ FD_ARBNOTIFY_KEY_MAX ][ 32 ];
 };
@@ -33,10 +36,11 @@ struct fd_arbnotify {
 typedef struct fd_arbnotify fd_arbnotify_t;
 
 /* 记录的定长决定了 link 的 mtu：mtu 必须直接取 sizeof(fd_arbnotify_t)，
-   禁止在拓扑里另写数字。32 位字段后面的 2 字节隐式填充与 _pad 一起让
-   sizeof 落在 8 的整数倍上。 */
+   禁止在拓扑里另写数字。accdb_fork_id 后面的 2 字节隐式填充、_pad 与尾部
+   填充让 sizeof 落在 384，与 dcache 按 128 字节对齐后的槽大小相同，因此环
+   内存不随每条记录携带的 key 条数变化。 */
 
-FD_STATIC_ASSERT( sizeof(fd_arbnotify_t)==352UL, fd_arbnotify_layout );
+FD_STATIC_ASSERT( sizeof(fd_arbnotify_t)==384UL, fd_arbnotify_layout );
 
 /* FD_ARBNOTIFY_LINK_LE / FD_ARBNOTIFY_LINK_RP 是两个执行 tile 各自的出链
    路名：leader 路径的 execle tile 发布到前者，replay 路径的 execrp tile
@@ -57,6 +61,10 @@ FD_PROTOTYPES_BEGIN
    槽与填充字节因此都是确定的 0。hit_cnt 超过 FD_ARBNOTIFY_KEY_MAX 时只写
    前 FD_ARBNOTIFY_KEY_MAX 条，key_cnt 记录实际写入的条数。
 
+   part 是同一笔交易的第几片（从 0 起），more 为 1 表示该交易还有后续分片：
+   可提交命中超过一条记录的容量时，调用方按片发布多条记录，读者据此识别
+   同一笔交易的多片而不能当成重复记录。
+
    sig 指向 64 字节签名，为 NULL 时签名区写全 0（交易没有签名）。hits 为
    NULL 时按 hit_cnt==0 处理。 */
 
@@ -69,7 +77,9 @@ fd_arbnotify_fill( fd_arbnotify_t *           rec,
                    ushort                     matched,
                    uchar const *              sig,
                    fd_arbfilter_hit_t const * hits,
-                   ulong                      hit_cnt ) {
+                   ulong                      hit_cnt,
+                   uchar                      part,
+                   uchar                      more ) {
   fd_memset( rec, 0, sizeof(fd_arbnotify_t) );
 
   rec->slot             = slot;
@@ -77,6 +87,8 @@ fd_arbnotify_fill( fd_arbnotify_t *           rec,
   rec->accdb_fork_id    = accdb_fork_id;
   rec->accdb_generation = accdb_generation;
   rec->matched          = matched;
+  rec->part             = part;
+  rec->more             = more;
 
   if( FD_LIKELY( sig ) ) fd_memcpy( rec->sig, sig, 64UL );
 

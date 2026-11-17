@@ -246,39 +246,72 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
     FD_LOG_WARNING(( "block marked dead (slot=%lu) because of invalid transaction (signature=%s) (txn_err=%d)", ctx->slot, signature_b58, ctx->txn_out.err.txn_err ));
   }
 
-  /* 用 arbfilter 判定这笔已执行完的交易。判定本身只读过滤器表并累加一次
-     计数；只有命中时才把命中的 key 与所属 accdb fork 发布到 arb_notify
-     环，未命中路径因此只有两次原子加。发布环没有消费者，stem 不为其建
-     立流控，发布不会阻塞本 tile。 */
+  /* 用 arbfilter 判定这笔已执行完的交易。判定本身只读过滤器表；只有命中
+     且存在会被提交进 bank 的账户时，才把这些 key 与所属 accdb fork 发布到
+     arb_notify 环，可提交命中超过一条记录的容量时按片发布。未命中路径因此
+     只有一次原子加。发布环没有消费者，stem 不为其建立流控，发布不会阻塞
+     本 tile。 */
   fd_arbfilter_hit_t arb_hits[ FD_ARBNOTIFY_KEY_MAX ];
-  ulong              arb_hit_cnt = 0UL;
-  ulong              matched     = fd_arbfilter_collect(
+  ulong              arb_emitted   = 0UL;
+  ulong              arb_hit_cnt   = 0UL;
+  ulong              arb_more      = 0UL;
+  ulong              matched       = fd_arbfilter_collect(
       ctx->arbfilter, TXN( ctx->txn_in.txn ), ctx->txn_in.txn->payload,
       (uchar const *)ctx->txn_out.accounts.keys, ctx->txn_out.accounts.cnt,
-      arb_hits, &arb_hit_cnt, FD_ARBNOTIFY_KEY_MAX );
-  if( FD_LIKELY( matched ) ) FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_emit, 1UL );
-  else                       FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_skip, 1UL );
+      ctx->txn_out.accounts.is_writable,
+      ctx->txn_out.accounts.touched,
+      ctx->txn_out.accounts.account_acquired,
+      !ctx->txn_out.err.txn_err,
+      &arb_emitted, arb_hits, &arb_hit_cnt, &arb_more, FD_ARBNOTIFY_KEY_MAX );
 
-  if( FD_UNLIKELY( matched && arb_hit_cnt ) ) {
-    fd_txn_t const * arb_txn = TXN( ctx->txn_in.txn );
+  if( FD_LIKELY( matched ) ) {
+    FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_emit, 1UL );
+    if( FD_UNLIKELY( !arb_hit_cnt ) ) {
+      /* 命中账户一个也不会提交（例如只命中了程序账户）：禁止发布空记录。 */
+      FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_noacct, 1UL );
+    } else {
+      fd_txn_t const * arb_txn  = TXN( ctx->txn_in.txn );
+      uchar const *    arb_sig  = arb_txn->signature_cnt ? ctx->txn_in.txn->payload + arb_txn->signature_off : NULL;
+      uchar            arb_part = 0U;
+      FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_published, 1UL );
 
-    /* generation 与 fork id 一起构成这笔交易执行时的 fork 坐标：fork 池槽
-       位被复用时 generation 递增，消费者据此判断记录是否已经陈旧。 */
-    fd_arbnotify_fill(
-        fd_chunk_to_laddr( ctx->arb_notify->mem, ctx->arb_notify->chunk ),
-        ctx->bank->f.slot, ctx->bank->bank_seq,
-        ctx->bank->accdb_fork_id.val,
-        fd_accdb_fork_gen( ctx->accdb, ctx->bank->accdb_fork_id ),
-        (ushort)matched,
-        arb_txn->signature_cnt ? ctx->txn_in.txn->payload + arb_txn->signature_off : NULL,
-        arb_hits, arb_hit_cnt );
+      /* generation 与 fork id 一起构成这笔交易执行时的 fork 坐标：fork 池
+         槽位被复用时 generation 递增，消费者据此判断记录是否已经陈旧。 */
+      for(;;) {
+        fd_arbnotify_fill(
+            fd_chunk_to_laddr( ctx->arb_notify->mem, ctx->arb_notify->chunk ),
+            ctx->bank->f.slot, ctx->bank->bank_seq,
+            ctx->bank->accdb_fork_id.val,
+            fd_accdb_fork_gen( ctx->accdb, ctx->bank->accdb_fork_id ),
+            (ushort)matched,
+            arb_sig,
+            arb_hits, arb_hit_cnt, arb_part, (uchar)arb_more );
 
-    fd_stem_publish( stem, ctx->arb_notify->idx, ctx->arb_notify_seq++,
-                     ctx->arb_notify->chunk, sizeof(fd_arbnotify_t),
-                     0UL, 0UL, (ulong)fd_frag_meta_ts_comp( fd_tickcount() ) );
-    ctx->arb_notify->chunk = fd_dcache_compact_next( ctx->arb_notify->chunk, sizeof(fd_arbnotify_t),
-                                                     ctx->arb_notify->chunk0, ctx->arb_notify->wmark );
-    FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_published, 1UL );
+        fd_stem_publish( stem, ctx->arb_notify->idx, ctx->arb_notify_seq++,
+                         ctx->arb_notify->chunk, sizeof(fd_arbnotify_t),
+                         0UL, 0UL, (ulong)fd_frag_meta_ts_comp( fd_tickcount() ) );
+        ctx->arb_notify->chunk = fd_dcache_compact_next( ctx->arb_notify->chunk, sizeof(fd_arbnotify_t),
+                                                         ctx->arb_notify->chunk0, ctx->arb_notify->wmark );
+        FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_records, 1UL );
+
+        /* 一片发布完才继续下一片：arb_more 由下一次收集重新给出，上一片的
+           索引已记进 arb_emitted，因此分片之间不重复。 */
+        if( !arb_more ) break;
+        arb_part++;
+        arb_hit_cnt = 0UL;
+        arb_more    = 0UL;
+        fd_arbfilter_collect(
+            ctx->arbfilter, arb_txn, ctx->txn_in.txn->payload,
+            (uchar const *)ctx->txn_out.accounts.keys, ctx->txn_out.accounts.cnt,
+            ctx->txn_out.accounts.is_writable,
+            ctx->txn_out.accounts.touched,
+            ctx->txn_out.accounts.account_acquired,
+            !ctx->txn_out.err.txn_err,
+            &arb_emitted, arb_hits, &arb_hit_cnt, &arb_more, FD_ARBNOTIFY_KEY_MAX );
+      }
+    }
+  } else {
+    FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_skip, 1UL );
   }
 
   fd_stem_publish( stem, ctx->execrp_replay_out->idx, (FD_EXECRP_TT_TXN_EXEC<<32)|ctx->tile_idx, ctx->execrp_replay_out->chunk, sizeof(*msg), 0UL, ctx->dispatch_time_comp, fd_frag_meta_ts_comp( fd_tickcount() ) );

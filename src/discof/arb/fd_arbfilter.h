@@ -61,8 +61,9 @@
 #define FD_ARBFILTER_BIT_PROG_ACCOUNT (2UL) /* R2：过滤器中的程序出现在账户列表里 */
 #define FD_ARBFILTER_BIT_HOT_ACCOUNT (4UL) /* R3：触及了热池账户 */
 
-/* fd_arbfilter_hit_t 是一个命中的 key。fd_arbfilter_collect 把命中的 key
-   按判定顺序去重后写进这种元素的数组，调用方据此把 key 发布给下游。 */
+/* fd_arbfilter_hit_t 是一个命中的 key。fd_arbfilter_collect 把会被提交进
+   bank 的命中 key 按判定顺序去重后写进这种元素的数组，调用方据此把 key
+   发布给下游。 */
 
 typedef struct {
   uchar key[ 32UL ];
@@ -98,12 +99,21 @@ struct fd_arbfilter_shmem {
 
   /* 由 exec tile 写入，其它进程只读。这些字段是普通计数器，用 relaxed
      原子操作累加，热路径因此不需要加锁。stat_ns 目前恒为 0，保留给匹配
-     耗时的累计器。stat_published 只统计命中后真的把记录发布到通知环的
-     交易，与 stat_emit 在同一处累加点上区分。 */
+     耗时的累计器。
+
+     stat_emit 按交易累加命中，stat_skip 按交易累加未命中，两者互斥且覆盖
+     全部交易。命中的交易再分两类：没有任何可提交账户（例如只命中了程序
+     账户）的不发布记录，进 stat_noacct；发布了记录的进 stat_published，
+     stat_published 按交易累加（一笔交易无论发几片都只加一），因此恒等式
+     stat_emit == stat_published + stat_noacct 恒成立。stat_records 按环里
+     实际的记录条数累加（一片加一），跨片交易多于一条，故
+     stat_records >= stat_published，两者相等说明没有任何交易需要跨片。 */
   ulong stat_emit;
   ulong stat_skip;
   ulong stat_ns;
   ulong stat_published;
+  ulong stat_noacct;
+  ulong stat_records;
 };
 
 typedef struct fd_arbfilter_shmem fd_arbfilter_shmem_t;
@@ -212,8 +222,8 @@ fd_arbfilter_acct_idx( fd_arbfilter_shmem_t const * f,
 
 /* arbfilter_hit_push 把 key 追加到 hits[0..*hit_cnt) 的尾部。已经在这个
    前缀里的 key 不重复写入，因此同一笔交易反复触到同一个 key 时只留一份。
-   hits_cap 用尽后新 key 直接丢弃：截断只影响 key 列表，不影响匹配结论，
-   所以位掩码仍然完整。 */
+   hits_cap 用尽后新 key 直接丢弃：截断只影响 key 列表，不影响匹配结论。
+   调用方 arbfilter_hit_take 在调用前已经确认还有空位。 */
 
 static inline void
 arbfilter_hit_push( fd_arbfilter_hit_t * hits,
@@ -227,9 +237,62 @@ arbfilter_hit_push( fd_arbfilter_hit_t * hits,
   *hit_cnt = cnt+1UL;
 }
 
+/* arbfilter_committable 判断第 i 个账户是否会被提交进 bank，判据与
+   fd_runtime_commit_txn 的提交循环逐条对应：交易本身没有失败，账户可写、
+   执行期被改动过，并且本笔交易持有它的 accdb 引用（bundle 里只有最后一笔
+   可写交易提交同一账户）。任一掩码为 NULL 时该维度不设限，供纯判定与单测
+   调用。 */
+
+static inline int
+arbfilter_committable( uchar const * writable,
+                       uchar const * touched,
+                       uchar const * acquired,
+                       int           commit_ok,
+                       ulong         i ) {
+  return commit_ok &&
+         ( !writable || writable[ i ] ) &&
+         ( !touched  || touched [ i ] ) &&
+         ( !acquired || acquired[ i ] );
+}
+
+/* arbfilter_emitted_test / arbfilter_emitted_set 查询与置位「索引 i 已经
+   发布过」的位。emitted 是 64 位索引位图，acc_cnt 必须不超过
+   MAX_TX_ACCOUNT_LOCKS（64）；超出 64 的索引不参与位图，这些账户在分片
+   之间可能被重复发布。 */
+
+static inline int
+arbfilter_emitted_test( ulong const * emitted,
+                        ulong         i ) {
+  return emitted && i<64UL && !!( *emitted & (1UL<<i) );
+}
+
+static inline void
+arbfilter_emitted_set( ulong * emitted,
+                       ulong   i ) {
+  if( emitted && i<64UL ) *emitted |= 1UL<<i;
+}
+
+/* arbfilter_hit_take 把一个可提交的命中 key 收进本片：已经发布过的索引跳
+   过；本片已满时置 *more 并把该索引留给下一片；否则去重写入并置位索引。
+   位掩码与这里无关，调用方只在命中且满足提交判据时才调用。 */
+
+static inline void
+arbfilter_hit_take( fd_arbfilter_hit_t * hits,
+                    ulong *              hit_cnt,
+                    ulong                hits_cap,
+                    ulong *              emitted,
+                    ulong                i,
+                    uchar const *        key,
+                    ulong *              more ) {
+  if( arbfilter_emitted_test( emitted, i ) ) return;
+  if( FD_UNLIKELY( *hit_cnt>=hits_cap ) ) { if( more ) *more = 1UL; return; }
+  arbfilter_hit_push( hits, hit_cnt, hits_cap, key );
+  arbfilter_emitted_set( emitted, i );
+}
+
 /* fd_arbfilter_collect 用过滤器判定一笔交易，返回 FD_ARBFILTER_BIT_* 的
-   位掩码，同时把命中的 key 收集到 hits（判定规则与下面 fd_arbfilter_match
-   完全一致）：
+   位掩码，同时把「会提交进 bank 的命中账户」收集到 hits（判定规则与下面
+   fd_arbfilter_match 完全一致）：
 
      R1（PROG_DIRECT）：某条指令调用的程序在程序集合中；
      R2（PROG_ACCOUNT）：程序集合中的某个程序出现在账户列表里，即该
@@ -242,10 +305,22 @@ arbfilter_hit_push( fd_arbfilter_hit_t * hits,
    列表。用字节指针而不是 fd_acct_addr_t 指针，是为了让调用方能直接
    传入 fd_pubkey_t 数组而无需强制类型转换（那会触犯严格别名规则）。
 
-   hits 按判定顺序接收命中的 key，去重，最多写 hits_cap 条，实际条数写
-   进 *hit_cnt；hits 为 NULL 时既不读也不写 hit_cnt，此时本函数就是纯判
-   定。超过 hits_cap 的命中只丢弃 key，位掩码不受影响。收集 key 时必须扫完
-   整个账户列表而不提前退出，否则同一笔交易触到的后续关注 key 会丢失。
+   writable / touched / acquired 是 fd_txn_out_t.accounts 里同名 per-account
+   标志（is_writable / touched / account_acquired），commit_ok 表示这笔交易
+   会提交。三者与 commit_ok 一起复刻 fd_runtime_commit_txn 的提交判据：
+   只有 commit_ok && writable[i] && touched[i] && acquired[i] 的命中账户才进
+   hits。任一掩码为 NULL 时该维度不设限，供纯判定与单测使用。命中但不满足
+   提交判据的账户不收集，位掩码不受影响。
+
+   hits 按判定顺序接收命中 key，去重，最多写 hits_cap 条，实际条数写进
+   *hit_cnt；hits 为 NULL 时既不读也不写 hit_cnt，此时本函数就是纯判定。
+   emitted 是 64 位已发布索引位图：分片发布时调用方传同一份，已置位的索引
+   本片跳过，因此分片之间不重复；acc_cnt 必须不超过 64（该位图是一整字）。
+   去重只发生在一条记录之内：同一个 key 出现在多个账户下标、而这些下标被分
+   到不同片时，该 key 会在每片各发布一次。
+   收集满 hits_cap 而仍有未发布的可提交命中时 *more 置 1，调用方据此继续
+   下一片；收集时 *more 每次调用都重写为 0 或 1。收集 key 时必须扫完整个
+   账户列表而不提前退出，否则同一笔交易触到的后续关注 key 会丢失。
 
    本函数运行在 exec 热路径上：不发起系统调用、不分配内存、不打日志、
    不加锁、不写共享内存。 */
@@ -256,8 +331,14 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
                       uchar const *                payload,
                       uchar const *                accs,
                       ulong                        acc_cnt,
+                      uchar const *                writable,
+                      uchar const *                touched,
+                      uchar const *                acquired,
+                      int                          commit_ok,
+                      ulong *                      emitted,
                       fd_arbfilter_hit_t *         hits,
                       ulong *                      hit_cnt,
+                      ulong *                      more,
                       ulong                        hits_cap ) {
   if( FD_UNLIKELY( !accs ) ) {
     accs    = (uchar const *)fd_txn_get_acct_addrs( txn, payload );
@@ -266,6 +347,7 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
 
   ulong bits = 0UL;
   ulong cnt  = 0UL;
+  if( hits && more ) *more = 0UL; /* 纯判定（hits 为 NULL）时不写调用方的变量 */
 
   /* R1：程序通过账户数组下标直接给出。 */
   for( ulong i=0UL; i<(ulong)txn->instr_cnt; i++ ) {
@@ -274,7 +356,8 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
     uchar const * key = accs + prog_idx*FD_TXN_ACCT_ADDR_SZ;
     if( FD_UNLIKELY( fd_arbfilter_prog_idx( filter, key )!=ULONG_MAX ) ) {
       bits |= FD_ARBFILTER_BIT_PROG_DIRECT;
-      if( FD_UNLIKELY( hits ) ) arbfilter_hit_push( hits, &cnt, hits_cap, key );
+      if( FD_UNLIKELY( hits && arbfilter_committable( writable, touched, acquired, commit_ok, prog_idx ) ) )
+        arbfilter_hit_take( hits, &cnt, hits_cap, emitted, prog_idx, key, more );
       break;
     }
   }
@@ -287,7 +370,9 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
     int           in_acct = fd_arbfilter_acct_idx( filter, key )!=ULONG_MAX;
     if( FD_UNLIKELY( in_prog ) ) bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
     if( FD_UNLIKELY( in_acct ) ) bits |= FD_ARBFILTER_BIT_HOT_ACCOUNT;
-    if( FD_UNLIKELY( hits && ( in_prog || in_acct ) ) ) arbfilter_hit_push( hits, &cnt, hits_cap, key );
+    if( FD_UNLIKELY( hits && ( in_prog || in_acct ) &&
+                     arbfilter_committable( writable, touched, acquired, commit_ok, i ) ) )
+      arbfilter_hit_take( hits, &cnt, hits_cap, emitted, i, key, more );
     /* 只有纯判定（hits 为 NULL）时才提前退出：收集 key 的调用方要拿到这
        笔交易触到的全部关注 key，提前退出会让后面的命中丢失。 */
     if( FD_UNLIKELY( !hits && bits==( FD_ARBFILTER_BIT_PROG_DIRECT|want ) ) ) break;
@@ -307,7 +392,8 @@ fd_arbfilter_match( fd_arbfilter_shmem_t const * f,
                     uchar const *                 payload,
                     uchar const *                 accs,
                     ulong                         acc_cnt ) {
-  return fd_arbfilter_collect( f, txn, payload, accs, acc_cnt, NULL, NULL, 0UL );
+  return fd_arbfilter_collect( f, txn, payload, accs, acc_cnt,
+                               NULL, NULL, NULL, 1, NULL, NULL, NULL, NULL, 0UL );
 }
 
 FD_PROTOTYPES_END
