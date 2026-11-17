@@ -510,7 +510,8 @@ test_collect_commit( void * mem ) {
                                NULL, NULL, NULL, 1, &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==5UL );
-  FD_TEST( emitted==( (1UL<<7)-2UL ) ); /* 索引 1..6 */
+  /* 索引 1,2,3,5,6 命中热账户表；索引 4 是程序账户，只算程序命中，不进 keys[]。 */
+  FD_TEST( emitted==( ( (1UL<<7)-2UL ) & ~(1UL<<4) ) );
 
   /* 交易失败：什么都提交不了，hits 为空、more 为 0，位掩码照常。 */
   hit_cnt = 0UL; more = 0UL; emitted = 0UL;
