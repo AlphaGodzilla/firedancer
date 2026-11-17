@@ -1077,7 +1077,8 @@ bench_one( char const *    name,
 
   /* 表里每个 key 都在，偶数位是表外 key：命中数应约为一半。 */
   FD_LOG_NOTICE(( "BENCH %-22s %6.2f ns/查询  平均 %.2f 格  命中 %lu/%lu",
-                  name, ns, (double)probes_total/(double)LOOKUP_CNT, found, LOOKUP_CNT ));
+                  name, ns, (double)probes_total/(double)LOOKUP_CNT,
+                  (ulong)found, (ulong)LOOKUP_CNT ));
 }
 
 static void
