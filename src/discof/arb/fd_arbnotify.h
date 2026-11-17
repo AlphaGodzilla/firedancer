@@ -28,6 +28,7 @@
 struct fd_arbnotify {
   ulong  slot;             /* 交易所在 slot */
   ulong  bank_seq;         /* bank 序号，同一 slot 内排序用 */
+  ulong  index_in_slot;    /* 这笔交易在所属区块内的 0 起始位置，是权威排序键 */
   ushort accdb_fork_id;    /* 该交易执行时 bank 的 accdb fork id */
   uint   accdb_generation; /* 该 fork 的 generation，与 fork id 一起标识一次 fork 生命周期 */
   ushort matched;          /* FD_ARBFILTER_BIT_* 位掩码，含 readonly 命中 */
@@ -47,16 +48,19 @@ typedef struct fd_arbnotify fd_arbnotify_t;
 /* 记录的定长决定了 link 的 mtu：mtu 必须直接取 sizeof(fd_arbnotify_t)，
    禁止在拓扑里另写数字。
 
-   尺寸是 28（定长字段）+ 64（sig）+ 8*32（key）+ 8（key tag）+ 1（prog_tag_cnt）
-   + 8（prog_tag）= 365，按 8 字节对齐到 368。dcache 的槽按 128 字节对齐，
-   FD_DCACHE_SLOT_FOOTPRINT( 368 ) == 384，与不带 tag 的记录（槽同样 384）相
-   同，因此携带 key tag 与 prog tag 不增加任何环内存；代价是每片 key 容量从 9
-   降到 8。
+   尺寸是 36（定长字段，含 index_in_slot）+ 64（sig）+ 8*32（key）+ 8（key tag）
+   + 1（prog_tag_cnt）+ 8（prog_tag）= 373，按 8 字节对齐到 376。dcache 的槽按
+   128 字节对齐，FD_DCACHE_SLOT_FOOTPRINT( 376 ) == 384，与更小的记录占用同样
+   大的槽，因此 index_in_slot、key tag 与 prog tag 都不增加任何环内存。
+
+   index_in_slot 是交易在区块里的位置，也是唯一能跨环恢复顺序的键：冲突的交易
+   由调度器串行执行，但可能落在不同 execrp tile 的环里，读者按环轮询会把它们
+   的观察顺序打乱。
 
    外部读者必须先用 props 里的 rec_sz 校验本结构体的尺寸再解读记录：记录是
    定长裸布局，尺寸不一致时字段偏移全部失效。 */
 
-FD_STATIC_ASSERT( sizeof(fd_arbnotify_t)==368UL, fd_arbnotify_layout );
+FD_STATIC_ASSERT( sizeof(fd_arbnotify_t)==376UL, fd_arbnotify_layout );
 
 /* FD_ARBNOTIFY_LINK_LE / FD_ARBNOTIFY_LINK_RP 是两个执行 tile 各自的出链
    路名：leader 路径的 execle tile 发布到前者，replay 路径的 execrp tile
@@ -89,6 +93,7 @@ static inline fd_arbnotify_t *
 fd_arbnotify_fill( fd_arbnotify_t *           rec,
                    ulong                      slot,
                    ulong                      bank_seq,
+                   ulong                      index_in_slot,
                    ushort                     accdb_fork_id,
                    uint                       accdb_generation,
                    ushort                     matched,
@@ -103,6 +108,7 @@ fd_arbnotify_fill( fd_arbnotify_t *           rec,
 
   rec->slot             = slot;
   rec->bank_seq         = bank_seq;
+  rec->index_in_slot    = index_in_slot;
   rec->accdb_fork_id    = accdb_fork_id;
   rec->accdb_generation = accdb_generation;
   rec->matched          = matched;

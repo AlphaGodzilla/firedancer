@@ -285,6 +285,7 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
         fd_arbnotify_fill(
             fd_chunk_to_laddr( ctx->arb_notify->mem, ctx->arb_notify->chunk ),
             ctx->bank->f.slot, ctx->bank->bank_seq,
+            ctx->txn_in.index_in_slot,
             ctx->bank->accdb_fork_id.val,
             fd_accdb_fork_gen( ctx->accdb, ctx->bank->accdb_fork_id ),
             (ushort)matched,

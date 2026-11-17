@@ -450,6 +450,7 @@ handle_microblock( fd_execle_tile_t *  ctx,
           fd_arbnotify_fill(
               fd_chunk_to_laddr( ctx->arb_notify->mem, ctx->arb_notify->chunk ),
               bank->f.slot, bank->bank_seq,
+              txn_in->index_in_slot,
               bank->accdb_fork_id.val,
               fd_accdb_fork_gen( ctx->accdb, bank->accdb_fork_id ),
               (ushort)arb_matched,

@@ -772,10 +772,10 @@ static void
 test_notify_fill( void ) {
   /* 尺寸直接决定 dcache 的槽大小，必须由静态断言钉住；这里再断一次，让运行
      时也看得见。 */
-  FD_TEST( sizeof(fd_arbnotify_t)==368UL );
+  FD_TEST( sizeof(fd_arbnotify_t)==376UL );
   FD_TEST( sizeof(fd_arbnotify_t)%8UL==0UL );
-  /* dcache 的槽按 128 字节对齐：360 与 368 落在同一个槽里，记录尺寸的变化不
-     改变环占用的内存。 */
+  /* dcache 的槽按 128 字节对齐：加上 index_in_slot 后记录是 376 字节，仍落在
+     384 字节的槽里，环占用的内存不变。 */
   FD_TEST( ( ( sizeof(fd_arbnotify_t)+127UL )/128UL )*128UL==384UL );
 
   fd_arbfilter_hit_t hits[ FD_ARBNOTIFY_KEY_MAX+2UL ];
@@ -790,7 +790,7 @@ test_notify_fill( void ) {
   fd_arbnotify_t rec[1];
   memset( rec, 0xFF, sizeof(fd_arbnotify_t) );
 
-  fd_arbnotify_t * ret = fd_arbnotify_fill( rec, 12345UL, 7UL, (ushort)3U, 0U, (ushort)0x6U, sig, hits, 3UL, NULL, 0UL, 2U, 1U );
+  fd_arbnotify_t * ret = fd_arbnotify_fill( rec, 12345UL, 7UL, 4242UL, (ushort)3U, 0U, (ushort)0x6U, sig, hits, 3UL, NULL, 0UL, 2U, 1U );
   FD_TEST( ret==rec );
   FD_TEST( rec->slot==12345UL );
   FD_TEST( rec->bank_seq==7UL );
@@ -814,7 +814,7 @@ test_notify_fill( void ) {
   FD_TEST( !rec->_pad );
 
   /* 超过上限只写满 FD_ARBNOTIFY_KEY_MAX 条，key_cnt 报上限。 */
-  ret = fd_arbnotify_fill( rec, 1UL, 2UL, (ushort)0U, 0U, (ushort)0x2U, NULL, hits, FD_ARBNOTIFY_KEY_MAX+2UL, NULL, 0UL, 0U, 0U );
+  ret = fd_arbnotify_fill( rec, 1UL, 2UL, 9UL, (ushort)0U, 0U, (ushort)0x2U, NULL, hits, FD_ARBNOTIFY_KEY_MAX+2UL, NULL, 0UL, 0U, 0U );
   FD_TEST( ret->key_cnt==FD_ARBNOTIFY_KEY_MAX );
   for( ulong i=0UL; i<FD_ARBNOTIFY_KEY_MAX; i++ ) {
     FD_TEST( !memcmp( rec->keys[ i ], hits[ i ].key, 32UL ) );
