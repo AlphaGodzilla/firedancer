@@ -435,16 +435,17 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
 
   /* 第二遍：关注程序作为账户出现在交易里（R2）。CPI 内嵌调用的程序不会出现在
      顶层指令里，只能靠它是否被列进账户来发现，所以这一遍不能省。同样只扫静
-     态区间：程序 key 不可能由地址查找表加载。 */
+     态区间：程序 key 不可能由地址查找表加载。
+
+     这里**不能提前退出**：一笔多跳交易可能同时把几个关注程序列进账户，prog_tag
+     必须把它们都记下来；只有位掩码一位就够，但 tag 列表要完整。 */
   for( ulong i=0UL; i<static_cnt; i++ ) {
     uchar const * key  = accs + i*FD_TXN_ACCT_ADDR_SZ;
     ulong         slot = fd_arbfilter_prog_idx( filter, key );
-    if( FD_UNLIKELY( slot!=ULONG_MAX ) ) {
-      bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
-      if( FD_UNLIKELY( prog_tag_cnt && prog_tags ) )
-        arbfilter_prog_tag_add( prog_tags, prog_tag_cnt, prog_tag_cap, filter->prog[ slot ].tag );
-      break;
-    }
+    if( FD_UNLIKELY( slot==ULONG_MAX ) ) continue;
+    bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
+    if( FD_UNLIKELY( prog_tag_cnt && prog_tags ) )
+      arbfilter_prog_tag_add( prog_tags, prog_tag_cnt, prog_tag_cap, filter->prog[ slot ].tag );
   }
 
   /* 短路：两遍都没有命中任何关注程序，这笔交易与关注的程序无关，热账户表一
