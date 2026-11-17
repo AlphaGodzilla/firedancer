@@ -226,19 +226,19 @@ test_match( void * mem ) {
   uchar txn_mem[ 512UL ] __attribute__((aligned(alignof(fd_txn_t))));
   fd_txn_t * txn = test_txn_init( txn_mem, 1UL, 2UL );
   txn->instr[ 0 ].program_id = 1U;
-  FD_TEST( fd_arbfilter_match( f, txn, NULL, list_r1, 2UL )==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT ) );
+  FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)list_r1, 2UL )==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT ) );
 
   /* R2 单独成立：顶层指令调用列表里的另一个程序，而程序表成员只是被
      传进账户列表，等价于这笔交易对 DEX 程序发起了 CPI。 */
   txn->instr[ 0 ].program_id = 0U;
-  FD_TEST( fd_arbfilter_match( f, txn, NULL, list_r1, 2UL )==FD_ARBFILTER_BIT_PROG_ACCOUNT );
+  FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)list_r1, 2UL )==FD_ARBFILTER_BIT_PROG_ACCOUNT );
 
   /* R3 单独成立：列表里只有付款方与热账户，且顶层指令调用的是付款方。 */
   fd_acct_addr_t list_r3[ 2UL ];
   memset( list_r3, 0, sizeof(list_r3) );
   memcpy( list_r3[ 0 ].b, pad_key, 32UL );
   memcpy( list_r3[ 1 ].b, hot_key, 32UL );
-  FD_TEST( fd_arbfilter_match( f, txn, NULL, list_r3, 2UL )==FD_ARBFILTER_BIT_HOT_ACCOUNT );
+  FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)list_r3, 2UL )==FD_ARBFILTER_BIT_HOT_ACCOUNT );
 
   /* 三条同时成立：指令直调程序表成员，它同时被记作 R2，列表里还有热账户。 */
   fd_acct_addr_t list_all[ 2UL ];
@@ -246,7 +246,7 @@ test_match( void * mem ) {
   memcpy( list_all[ 0 ].b, hot_key,  32UL );
   memcpy( list_all[ 1 ].b, prog_key, 32UL );
   txn->instr[ 0 ].program_id = 1U;
-  FD_TEST( fd_arbfilter_match( f, txn, NULL, list_all, 2UL )==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
+  FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)list_all, 2UL )==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
 
   /* 三条规则都不成立。 */
   fd_acct_addr_t unrelated[ 2UL ];
@@ -254,10 +254,10 @@ test_match( void * mem ) {
   memcpy( unrelated[ 0 ].b, pad_key,  32UL );
   memcpy( unrelated[ 1 ].b, pad2_key, 32UL );
   txn->instr[ 0 ].program_id = 0U;
-  FD_TEST( fd_arbfilter_match( f, txn, NULL, unrelated, 2UL )==0UL );
+  FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)unrelated, 2UL )==0UL );
 
   /* 空账户列表不命中，且不会越界读。 */
-  FD_TEST( fd_arbfilter_match( f, txn, NULL, unrelated, 0UL )==0UL );
+  FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)unrelated, 0UL )==0UL );
 
   /* accs 为 NULL 时改用交易线上的静态账户列表：R3 通过 payload 命中。 */
   uchar payload[ 256UL ];
@@ -299,7 +299,7 @@ test_match_empty( void * mem ) {
   txn->instr[ 0 ].program_id = 0U;
   txn->instr[ 1 ].program_id = 2U;
 
-  FD_TEST( fd_arbfilter_match( f, txn, NULL, accs, 3UL )==0UL );
+  FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 3UL )==0UL );
 }
 
 

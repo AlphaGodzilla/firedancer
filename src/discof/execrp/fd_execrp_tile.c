@@ -245,7 +245,7 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
      计数：不打日志、不分配内存、不发起系统调用。判定结果只进入统计，
      不向下游发布任何内容。 */
   ulong matched = fd_arbfilter_match( ctx->arbfilter, TXN( ctx->txn_in.txn ), ctx->txn_in.txn->payload,
-                                      (fd_acct_addr_t const *)ctx->txn_out.accounts.keys,
+                                      (uchar const *)ctx->txn_out.accounts.keys,
                                       ctx->txn_out.accounts.cnt );
   if( FD_LIKELY( matched ) ) FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_emit, 1UL );
   else                       FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_skip, 1UL );

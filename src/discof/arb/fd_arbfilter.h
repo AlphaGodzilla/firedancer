@@ -210,8 +210,11 @@ fd_arbfilter_acct_idx( fd_arbfilter_shmem_t const * f,
      R3（HOT_ACCOUNT）：  账户列表中有热池账户。
 
    txn 是解析后的交易，payload 是交易的线上字节。accs 是该交易已解析
-   的账户 key 列表（静态 key 加上地址查找表解析出的 key），acc_cnt 是
-   其长度；accs 为 NULL 时改用交易的静态账户列表。
+   的账户 key 列表（静态 key 加上地址查找表解析出的 key），按 32 字节
+   步长紧密排列，acc_cnt 是其长度；accs 为 NULL 时改用交易的静态账户
+   列表。用字节指针而不是 fd_acct_addr_t 指针，是为了让调用方能直接
+   传入 fd_pubkey_t 数组而无需强制类型转换（那会触犯严格别名规则）。
+ 
 
    本函数运行在 exec 热路径上：不发起系统调用、不分配内存、不打日志、
    不加锁、不写共享内存。 */
@@ -220,10 +223,10 @@ static inline ulong
 fd_arbfilter_match( fd_arbfilter_shmem_t const * f,
                     fd_txn_t const *              txn,
                     uchar const *                 payload,
-                    fd_acct_addr_t const *        accs,
+                    uchar const *                 accs,
                     ulong                         acc_cnt ) {
   if( FD_UNLIKELY( !accs ) ) {
-    accs    = fd_txn_get_acct_addrs( txn, payload );
+    accs    = (uchar const *)fd_txn_get_acct_addrs( txn, payload );
     acc_cnt = (ulong)txn->acct_addr_cnt;
   }
 
@@ -233,7 +236,7 @@ fd_arbfilter_match( fd_arbfilter_shmem_t const * f,
   for( ulong i=0UL; i<(ulong)txn->instr_cnt; i++ ) {
     ulong prog_idx = (ulong)txn->instr[ i ].program_id;
     if( FD_UNLIKELY( prog_idx>=acc_cnt ) ) continue; /* 交易数据不一致 */
-    if( FD_UNLIKELY( fd_arbfilter_prog_idx( f, accs[ prog_idx ].b )!=ULONG_MAX ) ) {
+    if( FD_UNLIKELY( fd_arbfilter_prog_idx( f, accs + prog_idx*FD_TXN_ACCT_ADDR_SZ )!=ULONG_MAX ) ) {
       bits |= FD_ARBFILTER_BIT_PROG_DIRECT;
       break;
     }
@@ -242,7 +245,7 @@ fd_arbfilter_match( fd_arbfilter_shmem_t const * f,
   /* R2/R3：对解析后的账户列表只遍历一遍。 */
   ulong want = FD_ARBFILTER_BIT_PROG_ACCOUNT | FD_ARBFILTER_BIT_HOT_ACCOUNT;
   for( ulong i=0UL; i<acc_cnt; i++ ) {
-    uchar const * key = accs[ i ].b;
+    uchar const * key = accs + i*FD_TXN_ACCT_ADDR_SZ;
     if( FD_UNLIKELY( fd_arbfilter_prog_idx( f, key )!=ULONG_MAX ) ) bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
     if( FD_UNLIKELY( fd_arbfilter_acct_idx( f, key )!=ULONG_MAX ) ) bits |= FD_ARBFILTER_BIT_HOT_ACCOUNT;
     if( FD_UNLIKELY( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|want ) ) ) break;
