@@ -746,8 +746,11 @@ static void
 test_notify_fill( void ) {
   /* 尺寸直接决定 dcache 的槽大小，必须由静态断言钉住；这里再断一次，让运行
      时也看得见。 */
-  FD_TEST( sizeof(fd_arbnotify_t)==360UL );
+  FD_TEST( sizeof(fd_arbnotify_t)==368UL );
   FD_TEST( sizeof(fd_arbnotify_t)%8UL==0UL );
+  /* dcache 的槽按 128 字节对齐：360 与 368 落在同一个槽里，记录尺寸的变化不
+     改变环占用的内存。 */
+  FD_TEST( ( ( sizeof(fd_arbnotify_t)+127UL )/128UL )*128UL==384UL );
 
   fd_arbfilter_hit_t hits[ FD_ARBNOTIFY_KEY_MAX+2UL ];
   for( ulong i=0UL; i<FD_ARBNOTIFY_KEY_MAX+2UL; i++ ) {
