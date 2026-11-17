@@ -1424,6 +1424,7 @@ fd_topo_initialize( config_t * config ) {
   {
     fd_topo_obj_t * arbf_obj = fd_topob_obj( topo, "arbfilter", "arbfilter" );
     FOR(execrp_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "execrp", i ) ], arbf_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    FOR(execle_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "execle", i ) ], arbf_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     FD_TEST( fd_pod_insertf_ulong( topo->props, arbf_obj->id, "arbfilter" ) );
   }
 

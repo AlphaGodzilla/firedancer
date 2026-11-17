@@ -13,6 +13,7 @@
 #include "../../discof/fd_startup.h"
 #include "../../flamenco/runtime/fd_runtime.h"
 #include "../../flamenco/runtime/fd_bank.h"
+#include "../../discof/arb/fd_arbfilter.h"
 #include "../../flamenco/progcache/fd_progcache_user.h"
 #include "../../flamenco/log_collector/fd_log_collector_base.h"
 #include <time.h>
@@ -71,6 +72,9 @@ struct fd_execle_tile {
   fd_accdb_t * accdb;
 
   fd_progcache_t  progcache[1];
+  /* 交易过滤器：leader 路径与 replay 路径都要在提交后判定，否则自己
+     出的块不会进入过滤。 */
+  fd_arbfilter_shmem_t * arbfilter;
 
   fd_runtime_t runtime[1];
 
@@ -401,6 +405,14 @@ handle_microblock( fd_execle_tile_t *  ctx,
        would be no way to undo the partially applied changes to the bank
        in finalize anyway. */
     fd_runtime_commit_txn( ctx->runtime, bank, txn_in, txn_out );
+
+    /* 与 replay 路径一致：提交后判定这笔交易，只累加统计，不向下游发布
+       任何内容。 */
+    ulong arb_matched = fd_arbfilter_match( ctx->arbfilter, TXN( txn ), txn->payload,
+                                            (uchar const *)txn_out->accounts.keys,
+                                            txn_out->accounts.cnt );
+    if( FD_LIKELY( arb_matched ) ) FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_emit, 1UL );
+    else                           FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_skip, 1UL );
 
     long const txn_end_ticks = fd_tickcount();
     last_ticks = txn_end_ticks;
@@ -815,6 +827,11 @@ unprivileged_init( fd_topo_t const *      topo,
   FD_TEST( accdb_shmem );
   fd_sleep_t * accdb_sleep = topo->sleep_obj_id!=ULONG_MAX ? fd_sleep_join( fd_topo_obj_laddr( topo, topo->sleep_obj_id ) ) : NULL;
   ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL, accdb_sleep, fd_topo_find_tile( topo, "accdb", 0UL ), 0 ) );
+
+  ulong arbfilter_obj_id = fd_pod_query_ulong( topo->props, "arbfilter", ULONG_MAX );
+  if( FD_UNLIKELY( arbfilter_obj_id==ULONG_MAX ) ) FD_LOG_ERR(( "arbfilter object not found in topology" ));
+  ctx->arbfilter = fd_arbfilter_join( fd_topo_obj_laddr( topo, arbfilter_obj_id ) );
+  if( FD_UNLIKELY( !ctx->arbfilter ) ) FD_LOG_ERR(( "failed to join arbfilter" ));
   FD_TEST( ctx->accdb );
 
   for( ulong i=0UL; i<FD_PACK_MAX_TXN_PER_BUNDLE; i++ ) {
