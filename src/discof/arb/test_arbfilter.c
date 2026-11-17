@@ -711,7 +711,7 @@ test_collect_parts( void * mem ) {
   ulong emitted = 0UL;
 
   /* 第一片：收满 FD_ARBNOTIFY_KEY_MAX 条，more 置 1。 */
-  ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+1UL,
+  ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+2UL,
                                      all_set, all_set, all_set, 1,
                                      &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
@@ -732,7 +732,7 @@ test_collect_parts( void * mem ) {
   /* 第二片：带上第一片的 emitted，只剩后 2 个可提交命中。 */
   hit_cnt = 0UL;
   more    = 0UL;
-  bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+1UL,
+  bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+2UL,
                                all_set, all_set, all_set, 1,
                                &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
@@ -751,7 +751,7 @@ test_collect_parts( void * mem ) {
   /* 第三片：没有剩余命中，more 保持 0。 */
   hit_cnt = 0UL;
   more    = 0UL;
-  bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+1UL,
+  bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+2UL,
                                all_set, all_set, all_set, 1,
                                &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( bits==FD_ARBFILTER_BIT_HOT_ACCOUNT );
