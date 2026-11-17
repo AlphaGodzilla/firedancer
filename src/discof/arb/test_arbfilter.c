@@ -513,12 +513,13 @@ test_collect_commit( void * mem ) {
   /* 索引 1,2,3,5,6 命中热账户表；索引 4 是程序账户，只算程序命中，不进 keys[]。 */
   FD_TEST( emitted==( ( (1UL<<7)-2UL ) & ~(1UL<<4) ) );
 
-  /* 交易失败：什么都提交不了，hits 为空、more 为 0，位掩码照常。 */
+  /* 交易失败：什么都提交不了。程序命中照常（它由账户列表决定），热账户一位也
+     不置——第三段只探测会提交的账户，失败交易没有这种账户。 */
   hit_cnt = 0UL; more = 0UL; emitted = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 7UL,
                                writable, touched, acquired, 0,
                                &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, 8UL );
-  FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
+  FD_TEST( bits==FD_ARBFILTER_BIT_PROG_ACCOUNT );
   FD_TEST( hit_cnt==0UL );
   FD_TEST( more==0UL );
   FD_TEST( emitted==0UL );
