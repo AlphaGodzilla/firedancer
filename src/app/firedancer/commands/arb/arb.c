@@ -445,7 +445,7 @@ arb_watch_print( arb_accdb_ro_t *       ro,
   /* part/more 指出这条记录是同一笔交易的第几片、后面还有没有片：可提交
      命中超过一条记录的容量时一笔交易会占多条记录，读者不能当成重复记录。 */
   printf( "slot=%lu idx=%lu bank=%lu fork=%u part=%u more=%u bits=0x%x key=%s",
-          rec->slot, rec->index_in_slot, rec->bank_seq, (uint)rec->accdb_fork_id,
+          rec->slot, rec->order_key, rec->bank_seq, (uint)rec->accdb_fork_id,
           (uint)rec->part, (uint)rec->more, (uint)rec->matched, key_b58 );
   if( rec->tags[ key_idx ] ) printf( " tag=%u", (uint)rec->tags[ key_idx ] );
 
@@ -533,7 +533,7 @@ arb_watch( config_t * config ) {
         ulong prog_cnt = fd_ulong_min( (ulong)rec->prog_tag_cnt, (ulong)FD_ARBNOTIFY_PROG_TAG_MAX );
         if( prog_cnt ) {
           printf( "slot=%lu idx=%lu bank=%lu fork=%u part=%u progs=",
-                  rec->slot, rec->index_in_slot, rec->bank_seq,
+                  rec->slot, rec->order_key, rec->bank_seq,
                   (uint)rec->accdb_fork_id, (uint)rec->part );
           for( ulong p=0UL; p<prog_cnt; p++ ) printf( "%s%u", p ? "," : "", (uint)rec->prog_tag[ p ] );
           printf( "\n" );
