@@ -284,6 +284,10 @@ arbfilter_hit_take( fd_arbfilter_hit_t * hits,
                     ulong                i,
                     uchar const *        key,
                     ulong *              more ) {
+  /* 位图只有 64 位：索引装不下的账户既测不到也置不上，必须直接跳过。否则
+     这类索引每一片都会被当成「未发布」，*more 永远为 1，调用方的分片循环
+     不会终止。运行时保证 acc_cnt 不超过 64，这里仍然显式挡住。 */
+  if( FD_UNLIKELY( i>=64UL ) ) return;
   if( arbfilter_emitted_test( emitted, i ) ) return;
   if( FD_UNLIKELY( *hit_cnt>=hits_cap ) ) { if( more ) *more = 1UL; return; }
   arbfilter_hit_push( hits, hit_cnt, hits_cap, key );
