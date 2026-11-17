@@ -10,6 +10,7 @@
 #include "../../discof/backup/fd_backup_shmem.h"
 
 #include "../../discof/admin/fd_adminctl.h"
+#include "../../discof/arb/fd_arbfilter.h"
 
 #define VAL(name) (__extension__({                                                             \
   ulong __x = fd_pod_queryf_ulong( topo->props, ULONG_MAX, "obj.%lu.%s", obj->id, name );      \
@@ -202,6 +203,35 @@ fd_topo_obj_callbacks_t fd_obj_cb_txncache = {
   .footprint = txncache_footprint,
   .align     = txncache_align,
   .new       = txncache_new,
+};
+
+/* arbfilter 没有可调参数：一张固定大小的程序 id 集合、一张固定大小的
+   热账户表和三个计数器。它属于验证器拓扑，因此注册在 fd_firedancer 里，
+   与 accdb/txncache/banks 等对象一样只被 firedancer/firedancer-dev 链接。 */
+
+static ulong
+arbfilter_footprint( fd_topo_t const *     topo FD_FN_UNUSED,
+                     fd_topo_obj_t const * obj  FD_FN_UNUSED ) {
+  return fd_arbfilter_footprint();
+}
+
+static ulong
+arbfilter_align( fd_topo_t const *     topo FD_FN_UNUSED,
+                 fd_topo_obj_t const * obj  FD_FN_UNUSED ) {
+  return fd_arbfilter_align();
+}
+
+static void
+arbfilter_new( fd_topo_t const *     topo,
+               fd_topo_obj_t const * obj ) {
+  FD_TEST( fd_arbfilter_new( fd_topo_obj_laddr( topo, obj->id ) ) );
+}
+
+fd_topo_obj_callbacks_t fd_obj_cb_arbfilter = {
+  .name      = "arbfilter",
+  .footprint = arbfilter_footprint,
+  .align     = arbfilter_align,
+  .new       = arbfilter_new,
 };
 
 static ulong

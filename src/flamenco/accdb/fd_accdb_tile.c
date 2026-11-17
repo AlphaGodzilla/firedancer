@@ -177,6 +177,15 @@ unprivileged_init( fd_topo_t const *      topo,
     FD_TEST( external_epoch_cnt<FD_ACCDB_TILE_MAX_EXTERNAL_EPOCHS );
     external_epoch_slots[ external_epoch_cnt++ ] = fseq;
   }
+  /* `arb` 动作以只读方式读 accdb。它不是 tile，其 epoch fseq 无法以
+     tile use 的形式出现，因此按 props 名查找。 */
+  ulong arb_epoch_obj_id = fd_pod_query_ulong( topo->props, "accdb_epoch.arb", ULONG_MAX );
+  if( FD_LIKELY( arb_epoch_obj_id!=ULONG_MAX ) ) {
+    ulong * fseq = fd_fseq_join( fd_topo_obj_laddr( topo, arb_epoch_obj_id ) );
+    FD_TEST( fseq );
+    FD_TEST( external_epoch_cnt<FD_ACCDB_TILE_MAX_EXTERNAL_EPOCHS );
+    external_epoch_slots[ external_epoch_cnt++ ] = fseq;
+  }
 
   ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, external_epoch_cnt, external_epoch_slots, NULL, 0UL, 1 ) );
   FD_TEST( ctx->accdb );

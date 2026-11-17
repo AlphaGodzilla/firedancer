@@ -4,6 +4,7 @@
 
 #include "../../choreo/tower/fd_tower_serdes.h"
 #include "../../discof/fd_startup.h"
+#include "../../discof/arb/fd_arbfilter.h"
 #include "../../discof/replay/fd_execrp.h"
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/runtime/fd_txncache.h"
@@ -64,6 +65,7 @@ struct fd_execrp_tile {
   fd_accdb_t *    accdb;
   fd_txncache_t * txncache;
   fd_progcache_t  progcache[1];
+  fd_arbfilter_shmem_t * arbfilter;
 
   ulong txn_idx;
   ulong slot;
@@ -238,6 +240,15 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
     FD_BASE58_ENCODE_64_BYTES( signature, signature_b58 );
     FD_LOG_WARNING(( "block marked dead (slot=%lu) because of invalid transaction (signature=%s) (txn_err=%d)", ctx->slot, signature_b58, ctx->txn_out.err.txn_err ));
   }
+
+  /* 用 arbfilter 判定这笔已执行完的交易。这里只读过滤器表并累加一次
+     计数：不打日志、不分配内存、不发起系统调用。判定结果只进入统计，
+     不向下游发布任何内容。 */
+  ulong matched = fd_arbfilter_match( ctx->arbfilter, TXN( ctx->txn_in.txn ), ctx->txn_in.txn->payload,
+                                      (fd_acct_addr_t const *)ctx->txn_out.accounts.keys,
+                                      ctx->txn_out.accounts.cnt );
+  if( FD_LIKELY( matched ) ) FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_emit, 1UL );
+  else                       FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_skip, 1UL );
 
   fd_stem_publish( stem, ctx->execrp_replay_out->idx, (FD_EXECRP_TT_TXN_EXEC<<32)|ctx->tile_idx, ctx->execrp_replay_out->chunk, sizeof(*msg), 0UL, ctx->dispatch_time_comp, fd_frag_meta_ts_comp( fd_tickcount() ) );
 
@@ -438,6 +449,12 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_sleep_t * accdb_sleep = topo->sleep_obj_id!=ULONG_MAX ? fd_sleep_join( fd_topo_obj_laddr( topo, topo->sleep_obj_id ) ) : NULL;
   ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL, accdb_sleep, fd_topo_find_tile( topo, "accdb", 0UL ), 0 ) );
   FD_TEST( ctx->accdb );
+
+  ulong arbfilter_obj_id = fd_pod_query_ulong( topo->props, "arbfilter", ULONG_MAX );
+  if( FD_UNLIKELY( arbfilter_obj_id==ULONG_MAX ) ) FD_LOG_ERR(( "arbfilter object not found in topology" ));
+  ctx->arbfilter = fd_arbfilter_join( fd_topo_obj_laddr( topo, arbfilter_obj_id ) );
+  if( FD_UNLIKELY( !ctx->arbfilter ) ) FD_LOG_ERR(( "failed to join arbfilter" ));
+  FD_LOG_INFO(( "arbfilter loaded: %lu programs, %lu hot accounts", ctx->arbfilter->prog_cnt, ctx->arbfilter->acct_cnt ));
 
   /* First find and setup the in-link from replay to exec. */
   ctx->replay_in->idx = fd_topo_find_tile_in_link( topo, tile, "replay_execrp", ctx->tile_idx );

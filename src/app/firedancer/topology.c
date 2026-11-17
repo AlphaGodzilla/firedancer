@@ -320,6 +320,7 @@ fd_topo_initialize( config_t * config ) {
   fd_topob_wksp( topo, "replay" );
   fd_topob_wksp( topo, "accdb"  );
   fd_topob_wksp( topo, "execrp" );
+  fd_topob_wksp( topo, "arbfilter" );
   if( alpenglow_enabled ) fd_topob_wksp( topo, "votor" );
   else                    fd_topob_wksp( topo, "tower" );
   if( !alpenglow_enabled ) fd_topob_wksp( topo, "txsend" );
@@ -1415,6 +1416,17 @@ fd_topo_initialize( config_t * config ) {
   }
   FD_TEST( fd_pod_insertf_ulong( topo->props, accdb_obj->id, "accdb" ) );
 
+  /* 唯一的 arbfilter 对象存放 DEX 程序 id 集合、热池账户表与 exec
+     tile 的计数器。每个 exec tile 都以读写方式映射它，因为要累加
+     emit/skip 计数；验证器之外的工具（见 `arb` 动作）以只读方式映射
+     它做转储，以读写方式映射它改配置。对象 id 写入拓扑 props，供这些
+     工具查找。 */
+  {
+    fd_topo_obj_t * arbf_obj = fd_topob_obj( topo, "arbfilter", "arbfilter" );
+    FOR(execrp_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "execrp", i ) ], arbf_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, arbf_obj->id, "arbfilter" ) );
+  }
+
   /* Each shred tile publishes the highest slot it relayed on turbine
      (getMaxRetransmitSlot) into an fseq that rpc reads on request. */
   if( FD_UNLIKELY( rpc_enabled ) ) {
@@ -1464,6 +1476,17 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_tile_uses( topo, snapmk_tile, fseq_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     fd_topob_tile_uses( topo, accdb_tile,  fseq_obj, FD_SHMEM_JOIN_MODE_READ_ONLY  );
     FD_TEST( fd_pod_insert_ulong( topo->props, "accdb_epoch.snapmk", fseq_obj->id ) );
+  }
+
+  /* `arb` 动作是 accdb 的只读消费者，但它不是 tile，accdb tile 因此
+     无法从 tile use 里收集它的 epoch 槽。这里照 rpc tile 的写法给它
+     一个专用 fseq：验证器内部没有谁写它，由外部进程以读写方式映射，
+     在读取账户期间把自己的 epoch 发布进去。 */
+  {
+    fd_topo_obj_t * fseq_obj = fd_topob_obj( topo, "fseq", "metric" );
+    fd_topo_tile_t * accdb_tile = &topo->tiles[ fd_topo_find_tile( topo, "accdb", 0UL ) ];
+    fd_topob_tile_uses( topo, accdb_tile, fseq_obj, FD_SHMEM_JOIN_MODE_READ_ONLY );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, fseq_obj->id, "accdb_epoch.arb" ) );
   }
 
   fd_pod_insert_int( topo->props, "sandbox", config->development.sandbox ? 1 : 0 );

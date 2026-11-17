@@ -30,6 +30,7 @@ extern fd_topo_obj_callbacks_t fd_obj_cb_rnonce_ss;
 extern fd_topo_obj_callbacks_t fd_obj_cb_footer_cache;
 extern fd_topo_obj_callbacks_t fd_obj_cb_adminctl;
 extern fd_topo_obj_callbacks_t fd_obj_cb_sleep;
+extern fd_topo_obj_callbacks_t fd_obj_cb_arbfilter;
 
 fd_topo_obj_callbacks_t * CALLBACKS[] = {
   &fd_obj_cb_mcache,
@@ -55,6 +56,7 @@ fd_topo_obj_callbacks_t * CALLBACKS[] = {
   &fd_obj_cb_footer_cache,
   &fd_obj_cb_adminctl,
   &fd_obj_cb_sleep,
+  &fd_obj_cb_arbfilter,
   NULL,
 };
 
@@ -199,6 +201,7 @@ extern action_t fd_action_ps;
 extern action_t fd_action_monitor_gossip;
 extern action_t fd_action_snapshot_create;
 extern action_t fd_action_wait;
+extern action_t fd_action_arb;
 
 action_t * ACTIONS[] = {
   &fd_action_run,
@@ -222,6 +225,7 @@ action_t * ACTIONS[] = {
   &fd_action_ps,
   &fd_action_snapshot_create,
   &fd_action_wait,
+  &fd_action_arb,
   NULL,
 };
 

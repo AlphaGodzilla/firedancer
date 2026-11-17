@@ -4,6 +4,14 @@
 #include "../platform/fd_cap_chk.h"
 #include "../../choreo/tower/fd_tower_file.h"
 
+/* FD_ACTION_ARB_{PROG,ACCT}_MAX 是 `arb filter-set` 一次能提交的程序 id
+   与热账户上限，等于 arbfilter 对象的可配置条目上限（不是表的槽数）。
+   本头文件属于 fdctl_shared 层，不能依赖 discof，因此上限在这里定义；
+   arb.c 用 FD_STATIC_ASSERT 把它们与 arbfilter 对象的上限对齐。 */
+
+#define FD_ACTION_ARB_PROG_MAX (64UL)
+#define FD_ACTION_ARB_ACCT_MAX (1024UL)
+
 /* FD_APP_NAME and FD_BINARY_NAME identify the control binary at run time
    (e.g. "Firedancer"/"firedancer", "Frankendancer"/"fddev").  They are
    defined once per binary in its main translation unit.  Commands
@@ -227,6 +235,20 @@ union fdctl_args {
     int   silent;
     char  name[ 64UL ];
   } wait;
+
+  /* cmd 是位置参数给出的子命令（filter-dump / filter-set / account），
+     NULL 表示没给。pubkey 是 `account` 的那个 base58 参数。prog 与 acct
+     是 `filter-set` 给出的 base58 参数，按出现顺序记下指针，由命令自己
+     解码，cnt 是各自的个数。 */
+
+  struct {
+    char const * cmd;
+    char const * pubkey;
+    char const * prog[ FD_ACTION_ARB_PROG_MAX ];
+    ulong        prog_cnt;
+    char const * acct[ FD_ACTION_ARB_ACCT_MAX ];
+    ulong        acct_cnt;
+  } arb;
 };
 
 typedef union fdctl_args args_t;
