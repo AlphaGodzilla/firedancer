@@ -25,6 +25,7 @@
    本对象，这里只存 32 字节 key。 */
 
 #include "../../ballet/txn/fd_txn.h"
+#include "../../util/fd_hash32.h"
 
 /* FD_ARBFILTER_MAGIC 标识一个已格式化的 arbfilter 内存区域。结尾的数字是
    内存布局版本：只要结构体布局发生变化（表项加字段、计数器增删等）就必须
@@ -128,19 +129,31 @@ struct fd_arbfilter_shmem {
 
 typedef struct fd_arbfilter_shmem fd_arbfilter_shmem_t;
 
-/* arbfilter_hash 把 32 字节 key 哈希成探测起点。它对 key 的四个 64 位字
-   依次做 FNV-1a 混合：足以把池子 key 打散到整张表，代价是四次装载而不是
-   32 次逐字节轮。它不是密码学哈希：唯一的写方是本地受信的 `arb` 动作，
-   能构造 key 的一方最多只能拉长自己账户的探测链。 */
+/* arbfilter_hash 把 32 字节 key 哈希成探测起点。用仓库自带的 fd_hash32
+   （xxHash3 的 32 字节变体）：四次装载加两路独立的 mul128 折叠，既没有逐字节
+   轮的开销，混合质量也远好于把四个字串成一条乘法依赖链。质量在此处直接换取
+   探测次数：混合差的哈希会让未命中多走几格，而每多走一格就是一次随机访存。
+
+   它不是密码学哈希，也不需要是：唯一的写方是本地受信的 `arb` 动作，能构造
+   key 的一方最多只能拉长自己账户的探测链。 */
 
 FD_FN_PURE static inline ulong
 arbfilter_hash( uchar const * key ) {
-  ulong h = 0xcbf29ce484222325UL;
-  for( ulong i=0UL; i<4UL; i++ ) {
-    h ^= FD_LOAD( ulong, key + 8UL*i );
-    h *= 0x100000001b3UL;
-  }
-  return h;
+  return fd_hash32( key, 0x61726266696c7465UL ); /* "arbfilte" */
+}
+
+/* arbfilter_key_eq 比较两个 32 字节 key 是否相等。定长 32 字节用小整数比较比
+   调用 fd_memeq 划算得多：fd_memeq 在 x86 上走 `repe cmpsb`，短长度也要十几到
+   二十几个周期的启动开销；这里展开成四次 64 位装载与异或归约，编译器生成 8 条
+   mov 加几条 xor/or，且完全可并行。经 FD_LOAD 读取因此没有严格别名问题。 */
+
+FD_FN_PURE static inline int
+arbfilter_key_eq( uchar const * a,
+                  uchar const * b ) {
+  return !( ( FD_LOAD( ulong, a      )^FD_LOAD( ulong, b      ) ) |
+            ( FD_LOAD( ulong, a+ 8UL )^FD_LOAD( ulong, b+ 8UL ) ) |
+            ( FD_LOAD( ulong, a+16UL )^FD_LOAD( ulong, b+16UL ) ) |
+            ( FD_LOAD( ulong, a+24UL )^FD_LOAD( ulong, b+24UL ) ) );
 }
 
 /* arbfilter_tbl_find 在槽数为 mask+1 的表里查 key，命中返回槽号，未命中
@@ -163,7 +176,7 @@ arbfilter_tbl_find( fd_arbfilter_ent_t const * ent,
   for( ulong probe=0UL; probe<=mask; probe++ ) {
     if( FD_UNLIKELY( probe_cnt ) ) (*probe_cnt)++;
     if( !ent[ idx ].used ) break;
-    if( FD_UNLIKELY( fd_memeq( ent[ idx ].key, key, 32UL ) ) ) return idx;
+    if( FD_UNLIKELY( arbfilter_key_eq( ent[ idx ].key, key ) ) ) return idx;
     idx = (idx+1UL) & mask;
   }
   return ULONG_MAX;
@@ -247,7 +260,7 @@ arbfilter_hit_push( fd_arbfilter_hit_t * hits,
                     uchar const *        key,
                     uchar                tag ) {
   ulong cnt = *hit_cnt;
-  for( ulong i=0UL; i<cnt; i++ ) if( FD_UNLIKELY( fd_memeq( hits[ i ].key, key, 32UL ) ) ) return;
+  for( ulong i=0UL; i<cnt; i++ ) if( FD_UNLIKELY( arbfilter_key_eq( hits[ i ].key, key ) ) ) return;
   if( FD_UNLIKELY( cnt>=hits_cap ) ) return;
   fd_memcpy( hits[ cnt ].key, key, 32UL );
   hits[ cnt ].tag = tag;
@@ -449,7 +462,13 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
   }
 
   /* 短路：两遍都没有命中任何关注程序，这笔交易与关注的程序无关，热账户表一
-     条也不必探测。绝大多数交易在这里直接返回。 */
+     条也不必探测。绝大多数交易在这里直接返回。
+
+     已知且刻意的缺口：写账户的程序不在程序表里时，即使账户本身在热账户表内
+     也不会发布。最现实的一种是直接给池子账户转 SOL——交易里只有 system 程
+     序，池账户的 lamports 变了（对以 lamports 计价的池子就是真实的价格变
+     动），本函数仍会返回 0。要覆盖这种情况，只需去掉这个短路：第三段本来就
+     只对「会被提交」的账户探测，代价是每笔交易多几次哈希探测。 */
   if( FD_UNLIKELY( !( bits & ( FD_ARBFILTER_BIT_PROG_DIRECT | FD_ARBFILTER_BIT_PROG_ACCOUNT ) ) ) ) {
     if( FD_LIKELY( hits ) ) *hit_cnt = 0UL;
     return 0UL;

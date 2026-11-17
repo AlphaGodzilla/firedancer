@@ -2,6 +2,7 @@
 #include "fd_arbnotify.h"
 
 #include <string.h>
+#include <time.h>
 #if FD_HAS_THREADS
 #include <pthread.h>
 #endif
@@ -963,10 +964,141 @@ test_writer_exclusion( void * mem ) {
 
 #endif /* FD_HAS_THREADS */
 
+/* ===== 微基准（只在 `test_arbfilter bench` 时运行） =====
+
+   目的是把「32 字节 key 的比较与哈希」从整条链路里单独拉出来量，并在同一次
+   运行、同一台机器上对比四种组合：
+
+     FNV-1a + fd_memeq   改造前的实现
+     FNV-1a + 字比较     只换比较
+     fd_hash32 + fd_memeq  只换哈希
+     fd_hash32 + 字比较  当前实现
+
+   表布局与生产一致（2048 槽、1024 项、线性探测），查询一半命中表内 key、一半
+   是表外随机 key。输出每次查询的纳秒数与平均探测格数——后者反映哈希质量，混合
+   差会让未命中多走几格，而每多走一格就是一次随机访存。 */
+
+typedef ulong (*arb_bench_hash_t)( uchar const * );
+typedef int   (*arb_bench_eq_t)  ( uchar const *, uchar const * );
+
+static ulong
+bench_hash_fnv( uchar const * key ) {
+  ulong h = 0xcbf29ce484222325UL;
+  for( ulong i=0UL; i<4UL; i++ ) {
+    h ^= FD_LOAD( ulong, key + 8UL*i );
+    h *= 0x100000001b3UL;
+  }
+  return h;
+}
+
+static ulong
+bench_hash_fd32( uchar const * key ) {
+  return fd_hash32( key, 0x61726266696c7465UL );
+}
+
+static int
+bench_eq_cmpsb( uchar const * a,
+                uchar const * b ) {
+  return fd_memeq( a, b, 32UL );
+}
+
+static int
+bench_eq_words( uchar const * a,
+                uchar const * b ) {
+  return arbfilter_key_eq( a, b );
+}
+
+static ulong
+bench_rand( ulong * st ) {
+  ulong x = *st;
+  x ^= x<<13; x ^= x>>7; x ^= x<<17;
+  *st = x;
+  return x;
+}
+
+static void
+bench_one( char const *    name,
+           arb_bench_hash_t hash,
+           arb_bench_eq_t   eq ) {
+  enum { SLOT_CNT = 2048UL, ENT_CNT = 1024UL, LOOKUP_CNT = 2000000UL };
+
+  static uchar ent_key[ SLOT_CNT ][ 32UL ];
+  static uchar ent_used[ SLOT_CNT ];
+  static uchar probes [ ENT_CNT ][ 32UL ]; /* 一半查询用表内 key，一半用表外 key */
+
+  memset( ent_used, 0, sizeof(ent_used) );
+
+  ulong mask = SLOT_CNT - 1UL;
+  ulong rng  = 0x9e3779b97f4a7c15UL;
+
+  /* 装表：与生产一致的线性探测插入。 */
+  for( ulong i=0UL; i<ENT_CNT; i++ ) {
+    uchar key[ 32UL ];
+    for( ulong w=0UL; w<4UL; w++ ) {
+      ulong v = bench_rand( &rng );
+      memcpy( key + 8UL*w, &v, 8UL );
+    }
+    ulong idx = hash( key ) & mask;
+    while( ent_used[ idx ] ) idx = (idx + 1UL) & mask;
+    ent_used[ idx ] = 1;
+    memcpy( ent_key[ idx ], key, 32UL );
+    memcpy( probes[ i ], key, 32UL );
+  }
+
+  /* 查询序列：偶数下标的查询改用表外 key，保证一半未命中。 */
+  for( ulong i=0UL; i<ENT_CNT; i++ ) {
+    if( i & 1UL ) continue;
+    uchar miss[ 32UL ];
+    for( ulong w=0UL; w<4UL; w++ ) {
+      ulong v = bench_rand( &rng );
+      memcpy( miss + 8UL*w, &v, 8UL );
+    }
+    memcpy( probes[ i ], miss, 32UL );
+  }
+
+  ulong probes_total = 0UL;
+  ulong found        = 0UL;
+
+  struct timespec t0, t1;
+  clock_gettime( CLOCK_MONOTONIC, &t0 );
+  for( ulong n=0UL; n<LOOKUP_CNT; n++ ) {
+    uchar const * key = probes[ n % ENT_CNT ];
+    ulong         idx = hash( key ) & mask;
+    for( ulong probe=0UL; probe<=mask; probe++ ) {
+      probes_total++;
+      if( !ent_used[ idx ] ) break;
+      if( FD_UNLIKELY( eq( ent_key[ idx ], key ) ) ) { found++; break; }
+      idx = (idx + 1UL) & mask;
+    }
+  }
+  clock_gettime( CLOCK_MONOTONIC, &t1 );
+
+  double ns = ( (double)( t1.tv_sec - t0.tv_sec )*1e9 + (double)( t1.tv_nsec - t0.tv_nsec ) ) / (double)LOOKUP_CNT;
+
+  /* 表里每个 key 都在，偶数位是表外 key：命中数应约为一半。 */
+  FD_LOG_NOTICE(( "BENCH %-22s %6.2f ns/查询  平均 %.2f 格  命中 %lu/%lu",
+                  name, ns, (double)probes_total/(double)LOOKUP_CNT, found, LOOKUP_CNT ));
+}
+
+static void
+bench_all( void ) {
+  bench_one( "FNV-1a + fd_memeq",   bench_hash_fnv,  bench_eq_cmpsb );
+  bench_one( "FNV-1a + 字比较",     bench_hash_fnv,  bench_eq_words );
+  bench_one( "fd_hash32 + fd_memeq",bench_hash_fd32, bench_eq_cmpsb );
+  bench_one( "fd_hash32 + 字比较",  bench_hash_fd32, bench_eq_words );
+}
+
 int
 main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
+
+  /* 微基准不依赖工作区，单独一条路径，不进 CI 的常规执行。 */
+  if( argc>1 && !strcmp( argv[ 1 ], "bench" ) ) {
+    bench_all();
+    fd_halt();
+    return 0;
+  }
 
   char const * _page_sz = fd_env_strip_cmdline_cstr ( &argc, &argv, "--page-sz",  NULL, "gigantic"               );
   ulong        page_cnt = fd_env_strip_cmdline_ulong( &argc, &argv, "--page-cnt", NULL, 1UL                      );
