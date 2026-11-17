@@ -754,7 +754,8 @@ test_collect_parts( void * mem ) {
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+2UL,
                                all_set, all_set, all_set, 1,
                                &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
-  FD_TEST( bits==FD_ARBFILTER_BIT_HOT_ACCOUNT );
+  /* 第三片：热账户都已发布，位掩码只剩程序命中（它由账户列表决定，与分片无关）。 */
+  FD_TEST( bits==FD_ARBFILTER_BIT_PROG_ACCOUNT );
   FD_TEST( hit_cnt==0UL );
   FD_TEST( more==0UL );
 }
