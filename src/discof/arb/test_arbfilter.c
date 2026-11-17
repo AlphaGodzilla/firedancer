@@ -717,7 +717,8 @@ test_collect_parts( void * mem ) {
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( more==1UL );
-  FD_TEST( emitted==( ( (1UL<<(FD_ARBNOTIFY_KEY_MAX+1UL))-1UL )<<1 ) ); /* 索引 2..9 */
+  /* 热账户从索引 2 开始，第一片收的是索引 2..9（程序账户在索引 1，不算热账户）。 */
+  FD_TEST( emitted==( ( (1UL<<(FD_ARBNOTIFY_KEY_MAX+2UL))-1UL ) & ~3UL ) );
 
   ulong seen = 0UL; /* 第 k 位表示 hot_key[k] 已经出现在某一片里 */
   for( ulong i=0UL; i<hit_cnt; i++ ) {
