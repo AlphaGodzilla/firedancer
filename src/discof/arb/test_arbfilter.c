@@ -405,7 +405,7 @@ test_collect( void * mem ) {
      判据掩码都传 NULL、commit_ok=1，提交集不设限，收集只由命中决定。 */
   txn->instr[ 0 ].program_id = 0U;
   ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL,
-                                     NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, 8UL );
+                                     NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( bits==fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 5UL ) );
   FD_TEST( hit_cnt==3UL );
@@ -418,7 +418,7 @@ test_collect( void * mem ) {
   txn->instr[ 0 ].program_id = 1U;
   hit_cnt = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL,
-                               NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, 8UL );
+                               NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==3UL );
   FD_TEST( !memcmp( hits[ 0 ].key, prog_key[ 0 ], 32UL ) );
@@ -426,13 +426,13 @@ test_collect( void * mem ) {
   /* 容量只有 2 条：key 列表截断，位掩码不受影响。 */
   hit_cnt = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL,
-                               NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, 2UL );
+                               NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 2UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==2UL );
 
   /* 不收集 key 时结果与 fd_arbfilter_match 相同。 */
   FD_TEST( fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL,
-                                 NULL, NULL, NULL, 1, NULL, NULL, NULL, NULL, 0UL )
+                                 NULL, NULL, NULL, 1, NULL, NULL, NULL, NULL, NULL, NULL, 0UL, 0UL )
            ==fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 5UL ) );
 
   /* 未命中：不写任何 key。 */
@@ -441,7 +441,7 @@ test_collect( void * mem ) {
   txn->instr[ 0 ].program_id = 0U;
   hit_cnt = 99UL;
   FD_TEST( fd_arbfilter_collect( f, txn, NULL, (uchar const *)none, 1UL,
-                                 NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, 8UL )==0UL );
+                                 NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 8UL )==0UL );
   FD_TEST( hit_cnt==0UL );
 }
 
@@ -489,7 +489,7 @@ test_collect_commit( void * mem ) {
      给出，位掩码因此是完整的。 */
   ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 7UL,
                                      writable, touched, acquired, 1,
-                                     &emitted, hits, &hit_cnt, &more, 8UL );
+                                     &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==2UL );
   FD_TEST( !memcmp( hits[ 0 ].key, hot_key[ 0 ], 32UL ) );
@@ -501,7 +501,7 @@ test_collect_commit( void * mem ) {
      与程序账户 [4]），位掩码与上面相同。 */
   hit_cnt = 0UL; more = 0UL; emitted = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 7UL,
-                               NULL, NULL, NULL, 1, &emitted, hits, &hit_cnt, &more, 8UL );
+                               NULL, NULL, NULL, 1, &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==6UL );
   FD_TEST( emitted==( (1UL<<7)-2UL ) ); /* 索引 1..6 */
@@ -510,7 +510,7 @@ test_collect_commit( void * mem ) {
   hit_cnt = 0UL; more = 0UL; emitted = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 7UL,
                                writable, touched, acquired, 0,
-                               &emitted, hits, &hit_cnt, &more, 8UL );
+                               &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==0UL );
   FD_TEST( more==0UL );
@@ -522,7 +522,7 @@ test_collect_commit( void * mem ) {
   hit_cnt = 0UL; more = 0UL; emitted = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 7UL,
                                writable, touched_all, acquired, 1,
-                               &emitted, hits, &hit_cnt, &more, 8UL );
+                               &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==3UL );
   FD_TEST( emitted==( (1UL<<1)|(1UL<<3)|(1UL<<6) ) );
@@ -589,7 +589,7 @@ test_collect_tags( void * mem ) {
       memset( hits, 0xAA, sizeof(hits) );
 
       ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 2UL,
-                                        NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, 4UL );
+                                        NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 4UL );
       FD_TEST( bits==case_bits[ c ] );
       FD_TEST( bits==fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 2UL ) );
       FD_TEST( hit_cnt==1UL );
@@ -597,6 +597,65 @@ test_collect_tags( void * mem ) {
       FD_TEST( hits[ 1 ].tag==0xAA ); /* 有效条数之外不写 */
     }
   }
+}
+
+/* test_collect_prog_tags 验证「命中的关注程序以 tag 形式随记录发布」：程序账户
+   永远只读、不会被提交，所以它的 key 不进 hits，命中身份只能由 prog_tag 表达。
+   R1 与 R2 命中都要记，且同一 tag 只出现一次；表项没设 tag 时不记。 */
+
+static void
+test_collect_prog_tags( void * mem ) {
+  fd_arbfilter_shmem_t * f = fd_arbfilter_join( fd_arbfilter_new( mem ) );
+  FD_TEST( f );
+
+  uchar prog_key[ 3UL ][ 32UL ];
+  test_key( prog_key[ 0 ], 200UL, 141U );
+  test_key( prog_key[ 1 ], 201UL, 141U );
+  test_key( prog_key[ 2 ], 202UL, 141U );
+
+  uchar pad_key[ 32UL ];
+  test_key( pad_key, 203UL, 141U );
+
+  uchar prog_tags[ 3UL ] = { 7U, 21U, 30U };
+  FD_TEST( fd_arbfilter_prog_set( f, 3UL, (uchar const (*)[32UL])prog_key, prog_tags )==0 );
+
+  /* 账户列表：[0]=付款方 [1]=被直调的程序 [2]=出现在账户表里的另一个程序。 */
+  fd_acct_addr_t accs[ 3UL ];
+  memset( accs, 0, sizeof(accs) );
+  memcpy( accs[ 0 ].b, pad_key,       32UL );
+  memcpy( accs[ 1 ].b, prog_key[ 0 ], 32UL );
+  memcpy( accs[ 2 ].b, prog_key[ 2 ], 32UL );
+
+  uchar txn_mem[ 512UL ] __attribute__((aligned(alignof(fd_txn_t))));
+  fd_txn_t * txn = test_txn_init( txn_mem, 1UL, 3UL );
+
+  /* 指令直调账户 1（tag 7）；账户 2 是另一个关注程序（tag 30）出现在账户表里。
+     两条规则同时命中，prog_tag 应依次是 {7,30}，去重且不重复。 */
+  txn->instr[ 0 ].program_id = 1U;
+
+  uchar prog_tag[ 8UL ];
+  ulong prog_tag_cnt = 0UL;
+  memset( prog_tag, 0xAA, sizeof(prog_tag) );
+
+  ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 3UL,
+                                     NULL, NULL, NULL, 1, NULL,
+                                     NULL, NULL, NULL,
+                                     prog_tag, &prog_tag_cnt, 8UL, 0UL );
+  FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT ) );
+  FD_TEST( prog_tag_cnt==2UL );
+  FD_TEST( prog_tag[ 0 ]==7U );
+  FD_TEST( prog_tag[ 1 ]==30U );
+  FD_TEST( prog_tag[ 2 ]==0xAA ); /* 有效条数之外不写 */
+
+  /* 程序表不带 tag 安装：命中仍然成立，但 prog_tag 列表为空。 */
+  FD_TEST( fd_arbfilter_prog_set( f, 3UL, (uchar const (*)[32UL])prog_key, NULL )==0 );
+  prog_tag_cnt = 99UL;
+  bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 3UL,
+                               NULL, NULL, NULL, 1, NULL,
+                               NULL, NULL, NULL,
+                               prog_tag, &prog_tag_cnt, 8UL, 0UL );
+  FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT ) );
+  FD_TEST( prog_tag_cnt==0UL );
 }
 
 /* test_collect_parts 验证分片收集：可提交命中超过 hits_cap 时 *more 置 1、
@@ -634,7 +693,7 @@ test_collect_parts( void * mem ) {
   /* 第一片：收满 FD_ARBNOTIFY_KEY_MAX 条，more 置 1。 */
   ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+1UL,
                                      all_set, all_set, all_set, 1,
-                                     &emitted, hits, &hit_cnt, &more, FD_ARBNOTIFY_KEY_MAX );
+                                     &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( bits==FD_ARBFILTER_BIT_HOT_ACCOUNT );
   FD_TEST( hit_cnt==FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( more==1UL );
@@ -654,7 +713,7 @@ test_collect_parts( void * mem ) {
   more    = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+1UL,
                                all_set, all_set, all_set, 1,
-                               &emitted, hits, &hit_cnt, &more, FD_ARBNOTIFY_KEY_MAX );
+                               &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( bits==FD_ARBFILTER_BIT_HOT_ACCOUNT );
   FD_TEST( hit_cnt==HOT_CNT-FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( more==0UL );
@@ -673,7 +732,7 @@ test_collect_parts( void * mem ) {
   more    = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+1UL,
                                all_set, all_set, all_set, 1,
-                               &emitted, hits, &hit_cnt, &more, FD_ARBNOTIFY_KEY_MAX );
+                               &emitted, hits, &hit_cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( bits==FD_ARBFILTER_BIT_HOT_ACCOUNT );
   FD_TEST( hit_cnt==0UL );
   FD_TEST( more==0UL );
@@ -702,7 +761,7 @@ test_notify_fill( void ) {
   fd_arbnotify_t rec[1];
   memset( rec, 0xFF, sizeof(fd_arbnotify_t) );
 
-  fd_arbnotify_t * ret = fd_arbnotify_fill( rec, 12345UL, 7UL, (ushort)3U, 0U, (ushort)0x6U, sig, hits, 3UL, 2U, 1U );
+  fd_arbnotify_t * ret = fd_arbnotify_fill( rec, 12345UL, 7UL, (ushort)3U, 0U, (ushort)0x6U, sig, hits, 3UL, NULL, 0UL, 2U, 1U );
   FD_TEST( ret==rec );
   FD_TEST( rec->slot==12345UL );
   FD_TEST( rec->bank_seq==7UL );
@@ -726,7 +785,7 @@ test_notify_fill( void ) {
   FD_TEST( !rec->_pad );
 
   /* 超过上限只写满 FD_ARBNOTIFY_KEY_MAX 条，key_cnt 报上限。 */
-  ret = fd_arbnotify_fill( rec, 1UL, 2UL, (ushort)0U, 0U, (ushort)0x2U, NULL, hits, FD_ARBNOTIFY_KEY_MAX+2UL, 0U, 0U );
+  ret = fd_arbnotify_fill( rec, 1UL, 2UL, (ushort)0U, 0U, (ushort)0x2U, NULL, hits, FD_ARBNOTIFY_KEY_MAX+2UL, NULL, 0UL, 0U, 0U );
   FD_TEST( ret->key_cnt==FD_ARBNOTIFY_KEY_MAX );
   for( ulong i=0UL; i<FD_ARBNOTIFY_KEY_MAX; i++ ) {
     FD_TEST( !memcmp( rec->keys[ i ], hits[ i ].key, 32UL ) );
@@ -901,6 +960,7 @@ main( int     argc,
   test_collect        ( mem );
   test_collect_commit ( mem );
   test_collect_tags   ( mem );
+  test_collect_prog_tags( mem );
   test_collect_parts  ( mem );
   test_notify_fill    ( );
   test_probe_bound    ( mem );

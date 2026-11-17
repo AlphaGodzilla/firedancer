@@ -19,6 +19,12 @@
 
 #define FD_ARBNOTIFY_KEY_MAX (8UL)
 
+/* FD_ARBNOTIFY_PROG_TAG_MAX 是一条记录最多携带的关注程序 tag 条数。程序账户
+   永远是只读的、不会被提交，因此它的 key 不会出现在 keys[] 里；程序表的命
+   中只以 tag 的形式随记录发布，读者据此知道这笔交易调用了哪些关注程序。 */
+
+#define FD_ARBNOTIFY_PROG_TAG_MAX (8UL)
+
 struct fd_arbnotify {
   ulong  slot;             /* 交易所在 slot */
   ulong  bank_seq;         /* bank 序号，同一 slot 内排序用 */
@@ -32,6 +38,8 @@ struct fd_arbnotify {
   uchar  sig[ 64 ];        /* 交易签名，供外部程序对账 */
   uchar  keys[ FD_ARBNOTIFY_KEY_MAX ][ 32 ];
   uchar  tags[ FD_ARBNOTIFY_KEY_MAX ]; /* 与 keys 一一对应，0 表示无 tag */
+  uchar  prog_tag_cnt;                                   /* prog_tag[] 中有效条数 */
+  uchar  prog_tag[ FD_ARBNOTIFY_PROG_TAG_MAX ];          /* 命中的关注程序表项 tag，已去重 */
 };
 
 typedef struct fd_arbnotify fd_arbnotify_t;
@@ -39,15 +47,16 @@ typedef struct fd_arbnotify fd_arbnotify_t;
 /* 记录的定长决定了 link 的 mtu：mtu 必须直接取 sizeof(fd_arbnotify_t)，
    禁止在拓扑里另写数字。
 
-   尺寸是 28（定长字段）+ 64（sig）+ 8*32（key）+ 8（tag）= 356，按 8 字节
-   对齐到 360。dcache 的槽按 128 字节对齐，FD_DCACHE_SLOT_FOOTPRINT( 360 )
-   == 384，因此带 tag 的记录与不带 tag 的记录占用同样大的槽，环内存不随每条
-   记录携带的 key 条数与 tag 变化；加 tag 的代价是每片 key 容量从 9 降到 8。
+   尺寸是 28（定长字段）+ 64（sig）+ 8*32（key）+ 8（key tag）+ 1（prog_tag_cnt）
+   + 8（prog_tag）= 365，按 8 字节对齐到 368。dcache 的槽按 128 字节对齐，
+   FD_DCACHE_SLOT_FOOTPRINT( 368 ) == 384，与不带 tag 的记录（槽同样 384）相
+   同，因此携带 key tag 与 prog tag 不增加任何环内存；代价是每片 key 容量从 9
+   降到 8。
 
    外部读者必须先用 props 里的 rec_sz 校验本结构体的尺寸再解读记录：记录是
    定长裸布局，尺寸不一致时字段偏移全部失效。 */
 
-FD_STATIC_ASSERT( sizeof(fd_arbnotify_t)==360UL, fd_arbnotify_layout );
+FD_STATIC_ASSERT( sizeof(fd_arbnotify_t)==368UL, fd_arbnotify_layout );
 
 /* FD_ARBNOTIFY_LINK_LE / FD_ARBNOTIFY_LINK_RP 是两个执行 tile 各自的出链
    路名：leader 路径的 execle tile 发布到前者，replay 路径的 execrp tile
@@ -86,6 +95,8 @@ fd_arbnotify_fill( fd_arbnotify_t *           rec,
                    uchar const *              sig,
                    fd_arbfilter_hit_t const * hits,
                    ulong                      hit_cnt,
+                   uchar const *              prog_tags,
+                   ulong                      prog_tag_cnt,
                    uchar                      part,
                    uchar                      more ) {
   fd_memset( rec, 0, sizeof(fd_arbnotify_t) );
@@ -106,6 +117,10 @@ fd_arbnotify_fill( fd_arbnotify_t *           rec,
     rec->tags[ i ] = hits[ i ].tag;
   }
   rec->key_cnt = (uchar)cnt;
+
+  ulong prog_cnt = ( prog_tags && prog_tag_cnt ) ? fd_ulong_min( prog_tag_cnt, FD_ARBNOTIFY_PROG_TAG_MAX ) : 0UL;
+  for( ulong i=0UL; i<prog_cnt; i++ ) rec->prog_tag[ i ] = prog_tags[ i ];
+  rec->prog_tag_cnt = (uchar)prog_cnt;
 
   return rec;
 }

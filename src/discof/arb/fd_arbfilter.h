@@ -312,6 +312,24 @@ arbfilter_hit_take( fd_arbfilter_hit_t * hits,
   arbfilter_emitted_set( emitted, i );
 }
 
+/* arbfilter_prog_tag_add 把一个关注程序表项的 tag 追加到 tags[0..*cnt)，去重。
+   tag 为 0 表示该表项没有设置标签，直接忽略：记录里的 prog_tag 用于区分关注
+   程序，全为 0 时携带它没有意义。容量用尽后新 tag 丢弃，不影响命中判定与
+   其他字段。 */
+
+static inline void
+arbfilter_prog_tag_add( uchar * tags,
+                        ulong * cnt,
+                        ulong   cap,
+                        uchar   tag ) {
+  if( FD_UNLIKELY( !tag ) ) return;
+  ulong c = *cnt;
+  for( ulong i=0UL; i<c; i++ ) if( FD_UNLIKELY( tags[ i ]==tag ) ) return;
+  if( FD_UNLIKELY( c>=cap ) ) return;
+  tags[ c ] = tag;
+  *cnt = c+1UL;
+}
+
 /* fd_arbfilter_collect 用过滤器判定一笔交易，返回 FD_ARBFILTER_BIT_* 的
    位掩码，同时把「会提交进 bank 的命中账户」收集到 hits（判定规则与下面
    fd_arbfilter_match 完全一致）：
@@ -364,6 +382,9 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
                       fd_arbfilter_hit_t *         hits,
                       ulong *                      hit_cnt,
                       ulong *                      more,
+                      uchar *                      prog_tags,
+                      ulong *                      prog_tag_cnt,
+                      ulong                        prog_tag_cap,
                       ulong                        hits_cap ) {
   if( FD_UNLIKELY( !accs ) ) {
     accs    = (uchar const *)fd_txn_get_acct_addrs( txn, payload );
@@ -373,6 +394,7 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
   ulong bits = 0UL;
   ulong cnt  = 0UL;
   if( hits && more ) *more = 0UL; /* 纯判定（hits 为 NULL）时不写调用方的变量 */
+  if( prog_tag_cnt ) *prog_tag_cnt = 0UL;
 
   /* R1：程序通过账户数组下标直接给出。 */
   for( ulong i=0UL; i<(ulong)txn->instr_cnt; i++ ) {
@@ -382,6 +404,10 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
     ulong         slot = fd_arbfilter_prog_idx( filter, key );
     if( FD_UNLIKELY( slot!=ULONG_MAX ) ) {
       bits |= FD_ARBFILTER_BIT_PROG_DIRECT;
+      /* 程序账户永远只读、不会被提交，它的 key 进不了 keys[]；这里改记表项
+         的 tag，读者据此知道这笔交易调用了哪个关注程序。 */
+      if( FD_UNLIKELY( prog_tag_cnt && prog_tags ) )
+        arbfilter_prog_tag_add( prog_tags, prog_tag_cnt, prog_tag_cap, filter->prog[ slot ].tag );
       if( FD_UNLIKELY( hits && arbfilter_committable( writable, touched, acquired, commit_ok, prog_idx ) ) )
         arbfilter_hit_take( hits, &cnt, hits_cap, emitted, prog_idx, key, filter->prog[ slot ].tag, more );
       break;
@@ -396,7 +422,11 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
     ulong         acct_slot = fd_arbfilter_acct_idx( filter, key );
     int           in_prog   = prog_slot!=ULONG_MAX;
     int           in_acct   = acct_slot!=ULONG_MAX;
-    if( FD_UNLIKELY( in_prog ) ) bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
+    if( FD_UNLIKELY( in_prog ) ) {
+      bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
+      if( FD_UNLIKELY( prog_tag_cnt && prog_tags ) )
+        arbfilter_prog_tag_add( prog_tags, prog_tag_cnt, prog_tag_cap, filter->prog[ prog_slot ].tag );
+    }
     if( FD_UNLIKELY( in_acct ) ) bits |= FD_ARBFILTER_BIT_HOT_ACCOUNT;
     if( FD_UNLIKELY( hits && ( in_prog || in_acct ) &&
                      arbfilter_committable( writable, touched, acquired, commit_ok, i ) ) ) {
@@ -426,7 +456,8 @@ fd_arbfilter_match( fd_arbfilter_shmem_t const * f,
                     uchar const *                 accs,
                     ulong                         acc_cnt ) {
   return fd_arbfilter_collect( f, txn, payload, accs, acc_cnt,
-                               NULL, NULL, NULL, 1, NULL, NULL, NULL, NULL, 0UL );
+                               NULL, NULL, NULL, 1, NULL,
+                               NULL, NULL, NULL, NULL, NULL, 0UL, 0UL );
 }
 
 FD_PROTOTYPES_END

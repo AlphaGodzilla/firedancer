@@ -419,6 +419,8 @@ handle_microblock( fd_execle_tile_t *  ctx,
     ulong              arb_emitted   = 0UL;
     ulong              arb_hit_cnt   = 0UL;
     ulong              arb_more      = 0UL;
+  uchar              arb_prog_tags[ FD_ARBNOTIFY_PROG_TAG_MAX ];
+  ulong              arb_prog_tag_cnt = 0UL;
     ulong              arb_matched   = fd_arbfilter_collect( ctx->arbfilter, TXN( txn ), txn->payload,
                                                            (uchar const *)txn_out->accounts.keys,
                                                            txn_out->accounts.cnt,
@@ -427,6 +429,8 @@ handle_microblock( fd_execle_tile_t *  ctx,
                                                            txn_out->accounts.account_acquired,
                                                            !txn_out->err.txn_err,
                                                            &arb_emitted, arb_hits, &arb_hit_cnt, &arb_more,
+                                                           arb_prog_tags, &arb_prog_tag_cnt,
+                                                           FD_ARBNOTIFY_PROG_TAG_MAX,
                                                            FD_ARBNOTIFY_KEY_MAX );
 
     if( FD_LIKELY( arb_matched ) ) {
@@ -450,7 +454,9 @@ handle_microblock( fd_execle_tile_t *  ctx,
               fd_accdb_fork_gen( ctx->accdb, bank->accdb_fork_id ),
               (ushort)arb_matched,
               arb_sig,
-              arb_hits, arb_hit_cnt, arb_part, (uchar)arb_more );
+              arb_hits, arb_hit_cnt,
+            arb_prog_tags, arb_prog_tag_cnt,
+            arb_part, (uchar)arb_more );
 
           fd_stem_publish( stem, ctx->arb_notify->idx, ctx->arb_notify_seq++, ctx->arb_notify->chunk,
                            sizeof(fd_arbnotify_t), 0UL, 0UL, (ulong)fd_frag_meta_ts_comp( fd_tickcount() ) );
@@ -464,6 +470,7 @@ handle_microblock( fd_execle_tile_t *  ctx,
           arb_part++;
           arb_hit_cnt = 0UL;
           arb_more    = 0UL;
+          arb_prog_tag_cnt = 0UL;
           fd_arbfilter_collect( ctx->arbfilter, arb_txn, txn->payload,
                                 (uchar const *)txn_out->accounts.keys,
                                 txn_out->accounts.cnt,
@@ -472,6 +479,8 @@ handle_microblock( fd_execle_tile_t *  ctx,
                                 txn_out->accounts.account_acquired,
                                 !txn_out->err.txn_err,
                                 &arb_emitted, arb_hits, &arb_hit_cnt, &arb_more,
+                                arb_prog_tags, &arb_prog_tag_cnt,
+                                FD_ARBNOTIFY_PROG_TAG_MAX,
                                 FD_ARBNOTIFY_KEY_MAX );
         }
       }

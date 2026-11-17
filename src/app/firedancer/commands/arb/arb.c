@@ -526,6 +526,18 @@ arb_watch( config_t * config ) {
         /* key_cnt 来自共享内存：按记录容量截断，避免读到其它版本写下的
            越界条数。 */
         ulong key_cnt = fd_ulong_min( (ulong)rec->key_cnt, (ulong)FD_ARBNOTIFY_KEY_MAX );
+
+        /* 命中的关注程序不在 keys[] 里（程序账户只读、不会被提交），它们以
+           prog_tag 的形式随记录发布：有 tag 就单独打一行，说明这笔交易调用了
+           哪几个关注程序。 */
+        ulong prog_cnt = fd_ulong_min( (ulong)rec->prog_tag_cnt, (ulong)FD_ARBNOTIFY_PROG_TAG_MAX );
+        if( prog_cnt ) {
+          printf( "slot=%lu bank=%lu fork=%u part=%u progs=",
+                  rec->slot, rec->bank_seq, (uint)rec->accdb_fork_id, (uint)rec->part );
+          for( ulong p=0UL; p<prog_cnt; p++ ) printf( "%s%u", p ? "," : "", (uint)rec->prog_tag[ p ] );
+          printf( "\n" );
+        }
+
         for( ulong k=0UL; k<key_cnt; k++ ) arb_watch_print( &ro, rec, k );
         records++;
         got = 1;

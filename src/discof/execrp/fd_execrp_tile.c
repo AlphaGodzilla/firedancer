@@ -255,6 +255,8 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
   ulong              arb_emitted   = 0UL;
   ulong              arb_hit_cnt   = 0UL;
   ulong              arb_more      = 0UL;
+  uchar              arb_prog_tags[ FD_ARBNOTIFY_PROG_TAG_MAX ];
+  ulong              arb_prog_tag_cnt = 0UL;
   ulong              matched       = fd_arbfilter_collect(
       ctx->arbfilter, TXN( ctx->txn_in.txn ), ctx->txn_in.txn->payload,
       (uchar const *)ctx->txn_out.accounts.keys, ctx->txn_out.accounts.cnt,
@@ -262,7 +264,9 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
       ctx->txn_out.accounts.touched,
       ctx->txn_out.accounts.account_acquired,
       !ctx->txn_out.err.txn_err,
-      &arb_emitted, arb_hits, &arb_hit_cnt, &arb_more, FD_ARBNOTIFY_KEY_MAX );
+      &arb_emitted, arb_hits, &arb_hit_cnt, &arb_more,
+      arb_prog_tags, &arb_prog_tag_cnt, FD_ARBNOTIFY_PROG_TAG_MAX,
+      FD_ARBNOTIFY_KEY_MAX );
 
   if( FD_LIKELY( matched ) ) {
     FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_emit, 1UL );
@@ -285,7 +289,9 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
             fd_accdb_fork_gen( ctx->accdb, ctx->bank->accdb_fork_id ),
             (ushort)matched,
             arb_sig,
-            arb_hits, arb_hit_cnt, arb_part, (uchar)arb_more );
+            arb_hits, arb_hit_cnt,
+            arb_prog_tags, arb_prog_tag_cnt,
+            arb_part, (uchar)arb_more );
 
         fd_stem_publish( stem, ctx->arb_notify->idx, ctx->arb_notify_seq++,
                          ctx->arb_notify->chunk, sizeof(fd_arbnotify_t),
@@ -300,6 +306,7 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
         arb_part++;
         arb_hit_cnt = 0UL;
         arb_more    = 0UL;
+        arb_prog_tag_cnt = 0UL;
         fd_arbfilter_collect(
             ctx->arbfilter, arb_txn, ctx->txn_in.txn->payload,
             (uchar const *)ctx->txn_out.accounts.keys, ctx->txn_out.accounts.cnt,
@@ -307,7 +314,9 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
             ctx->txn_out.accounts.touched,
             ctx->txn_out.accounts.account_acquired,
             !ctx->txn_out.err.txn_err,
-            &arb_emitted, arb_hits, &arb_hit_cnt, &arb_more, FD_ARBNOTIFY_KEY_MAX );
+            &arb_emitted, arb_hits, &arb_hit_cnt, &arb_more,
+            arb_prog_tags, &arb_prog_tag_cnt, FD_ARBNOTIFY_PROG_TAG_MAX,
+            FD_ARBNOTIFY_KEY_MAX );
       }
     }
   } else {
