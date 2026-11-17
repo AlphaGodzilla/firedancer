@@ -25,7 +25,6 @@
    本对象，这里只存 32 字节 key。 */
 
 #include "../../ballet/txn/fd_txn.h"
-#include "../../util/fd_hash32.h"
 
 /* FD_ARBFILTER_MAGIC 标识一个已格式化的 arbfilter 内存区域。结尾的数字是
    内存布局版本：只要结构体布局发生变化（表项加字段、计数器增删等）就必须
@@ -129,31 +128,24 @@ struct fd_arbfilter_shmem {
 
 typedef struct fd_arbfilter_shmem fd_arbfilter_shmem_t;
 
-/* arbfilter_hash 把 32 字节 key 哈希成探测起点。用仓库自带的 fd_hash32
-   （xxHash3 的 32 字节变体）：四次装载加两路独立的 mul128 折叠，既没有逐字节
-   轮的开销，混合质量也远好于把四个字串成一条乘法依赖链。质量在此处直接换取
-   探测次数：混合差的哈希会让未命中多走几格，而每多走一格就是一次随机访存。
+/* arbfilter_hash 把 32 字节 key 哈希成探测起点。它对 key 的四个 64 位字
+   依次做 FNV-1a 混合：足以把池子 key 打散到整张表，代价是四次装载而不是
+   32 次逐字节轮。它不是密码学哈希：唯一的写方是本地受信的 `arb` 动作，
+   能构造 key 的一方最多只能拉长自己账户的探测链。
 
-   它不是密码学哈希，也不需要是：唯一的写方是本地受信的 `arb` 动作，能构造
-   key 的一方最多只能拉长自己账户的探测链。 */
+   实测（test_arbfilter bench，同机同轮）：换成 fd_hash32 后平均探测格数从
+   2.02 降到 1.96，但每次查询反而更慢——在这份构建里 fd_hash32 走的是「每字
+   一次 fd_ulong_hash」的 fallback，多出来的乘法延迟盖过了少走的那一格。改
+   哈希之前必须重新跑这个基准，不要只看混合质量。 */
 
 FD_FN_PURE static inline ulong
 arbfilter_hash( uchar const * key ) {
-  return fd_hash32( key, 0x61726266696c7465UL ); /* "arbfilte" */
-}
-
-/* arbfilter_key_eq 比较两个 32 字节 key 是否相等。定长 32 字节用小整数比较比
-   调用 fd_memeq 划算得多：fd_memeq 在 x86 上走 `repe cmpsb`，短长度也要十几到
-   二十几个周期的启动开销；这里展开成四次 64 位装载与异或归约，编译器生成 8 条
-   mov 加几条 xor/or，且完全可并行。经 FD_LOAD 读取因此没有严格别名问题。 */
-
-FD_FN_PURE static inline int
-arbfilter_key_eq( uchar const * a,
-                  uchar const * b ) {
-  return !( ( FD_LOAD( ulong, a      )^FD_LOAD( ulong, b      ) ) |
-            ( FD_LOAD( ulong, a+ 8UL )^FD_LOAD( ulong, b+ 8UL ) ) |
-            ( FD_LOAD( ulong, a+16UL )^FD_LOAD( ulong, b+16UL ) ) |
-            ( FD_LOAD( ulong, a+24UL )^FD_LOAD( ulong, b+24UL ) ) );
+  ulong h = 0xcbf29ce484222325UL;
+  for( ulong i=0UL; i<4UL; i++ ) {
+    h ^= FD_LOAD( ulong, key + 8UL*i );
+    h *= 0x100000001b3UL;
+  }
+  return h;
 }
 
 /* arbfilter_tbl_find 在槽数为 mask+1 的表里查 key，命中返回槽号，未命中
@@ -162,6 +154,10 @@ arbfilter_key_eq( uchar const * a,
 
    probe_cnt 只给单测用：传非 NULL 时累加探测次数，正式代码的两个调用点都
    传 NULL，编译器据此把计数分支整段消掉，热路径没有额外指令。
+
+   比较用 fd_memeq：x86 上它编译成 `repe cmpsb`，有 FSRM（Fast Short REP）
+   的机器上对 32 字节定长比较比展开成 4 次 64 位装载更快——微基准实测 5.54 ns
+   对 7.47 ns。不要想当然地把它换成手写整数比较。
 
    本函数不做 FD_FN_PURE 标注：读方在 seqlock 重试循环里反复调用它，若允许
    编译器把多次调用的装载合并，重试就失去意义。调用点紧跟在 acquire 装载
@@ -176,7 +172,7 @@ arbfilter_tbl_find( fd_arbfilter_ent_t const * ent,
   for( ulong probe=0UL; probe<=mask; probe++ ) {
     if( FD_UNLIKELY( probe_cnt ) ) (*probe_cnt)++;
     if( !ent[ idx ].used ) break;
-    if( FD_UNLIKELY( arbfilter_key_eq( ent[ idx ].key, key ) ) ) return idx;
+    if( FD_UNLIKELY( fd_memeq( ent[ idx ].key, key, 32UL ) ) ) return idx;
     idx = (idx+1UL) & mask;
   }
   return ULONG_MAX;
@@ -260,7 +256,7 @@ arbfilter_hit_push( fd_arbfilter_hit_t * hits,
                     uchar const *        key,
                     uchar                tag ) {
   ulong cnt = *hit_cnt;
-  for( ulong i=0UL; i<cnt; i++ ) if( FD_UNLIKELY( arbfilter_key_eq( hits[ i ].key, key ) ) ) return;
+  for( ulong i=0UL; i<cnt; i++ ) if( FD_UNLIKELY( fd_memeq( hits[ i ].key, key, 32UL ) ) ) return;
   if( FD_UNLIKELY( cnt>=hits_cap ) ) return;
   fd_memcpy( hits[ cnt ].key, key, 32UL );
   hits[ cnt ].tag = tag;

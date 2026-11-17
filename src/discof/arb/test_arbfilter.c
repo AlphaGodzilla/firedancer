@@ -1,6 +1,8 @@
 #include "fd_arbfilter.h"
 #include "fd_arbnotify.h"
 
+#include "../../util/fd_hash32.h"
+
 #include <string.h>
 #include <time.h>
 #if FD_HAS_THREADS
@@ -1002,10 +1004,15 @@ bench_eq_cmpsb( uchar const * a,
   return fd_memeq( a, b, 32UL );
 }
 
+/* 微基准自带一份「字比较」实现：它曾经进过生产代码，实测比 fd_memeq 慢，于是
+   被回退。留在基准里是为了以后有人想再试时能直接量，而不必改生产路径。 */
 static int
 bench_eq_words( uchar const * a,
                 uchar const * b ) {
-  return arbfilter_key_eq( a, b );
+  return !( ( FD_LOAD( ulong, a      )^FD_LOAD( ulong, b      ) ) |
+            ( FD_LOAD( ulong, a+ 8UL )^FD_LOAD( ulong, b+ 8UL ) ) |
+            ( FD_LOAD( ulong, a+16UL )^FD_LOAD( ulong, b+16UL ) ) |
+            ( FD_LOAD( ulong, a+24UL )^FD_LOAD( ulong, b+24UL ) ) );
 }
 
 static ulong

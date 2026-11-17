@@ -31,7 +31,7 @@ arbfilter_tbl_insert( fd_arbfilter_ent_t * ent,
       ent[ idx ].used = 1;
       return 1;
     }
-    if( FD_UNLIKELY( arbfilter_key_eq( ent[ idx ].key, key ) ) ) return 0; /* 重复 key */
+    if( FD_UNLIKELY( fd_memeq( ent[ idx ].key, key, 32UL ) ) ) return 0; /* 重复 key */
     idx = (idx+1UL) & mask;
   }
   return 0;
