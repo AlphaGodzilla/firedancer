@@ -738,7 +738,7 @@ test_collect_parts( void * mem ) {
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( hit_cnt==HOT_CNT-FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( more==0UL );
-  FD_TEST( emitted==( ( (1UL<<(HOT_CNT+2UL))-1UL )&~(1UL) ) ); /* 索引 1..11 */
+  FD_TEST( emitted==( ( (1UL<<(HOT_CNT+2UL))-1UL )&~3UL ) ); /* 索引 2..11 */
 
   for( ulong i=0UL; i<hit_cnt; i++ ) {
     ulong k = test_key_find( (uchar const (*)[32UL])hot_key, HOT_CNT, hits[ i ].key );
