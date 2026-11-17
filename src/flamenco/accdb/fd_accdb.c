@@ -796,6 +796,13 @@ submit_cmd( fd_accdb_t * accdb,
   if( FD_UNLIKELY( accdb->sleep ) ) fd_sleep_ring( accdb->sleep, accdb->sleep_tile_id );
 }
 
+uint
+fd_accdb_fork_gen( fd_accdb_t const * accdb,
+                   fd_accdb_fork_id_t fork_id ) {
+  ulong fork_slot = (ulong)fork_id.val;
+  if( FD_UNLIKELY( fork_slot>=accdb->shmem->max_live_slots ) ) return 0U;
+  return FD_VOLATILE_CONST( accdb->fork_pool[ fork_slot ].shmem->generation );
+}
 fd_accdb_fork_id_t
 fd_accdb_attach_child( fd_accdb_t *       accdb,
                        fd_accdb_fork_id_t parent_fork_id ) {

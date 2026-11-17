@@ -213,6 +213,21 @@ fd_accdb_fork_id_t
 fd_accdb_attach_child( fd_accdb_t *       accdb,
                        fd_accdb_fork_id_t parent_fork_id );
 
+/* fd_accdb_fork_gen returns the generation of fork_id.  A fork pool slot
+   is reused after its fork is rooted away, and the generation is bumped
+   whenever that happens, so (fork_id, generation) identifies a fork
+   uniquely over time.  A caller that stores both can later detect that
+   the fork it observed is gone instead of silently reading the new fork
+   that reused the slot.
+
+   The read is a plain aligned load from shared memory: it is a hint for
+   staleness detection, not a synchronization primitive.  Returns 0 for a
+   fork id outside the pool. */
+
+uint
+fd_accdb_fork_gen( fd_accdb_t const * accdb,
+                   fd_accdb_fork_id_t fork_id );
+
 /* fd_accdb_advance_root advances the root of the accounts database to
    the given fork_id.  fork_id must be a direct child of the current
    root (i.e. fork->parent_id equals the current root_fork_id).

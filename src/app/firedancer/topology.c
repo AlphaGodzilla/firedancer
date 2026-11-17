@@ -40,6 +40,7 @@
 #include "../../flamenco/progcache/fd_progcache.h"
 #include "../../flamenco/runtime/fd_cost_tracker.h"
 #include "../../flamenco/stakes/fd_collector_overrides.h"
+#include "../../discof/arb/fd_arbnotify.h"
 
 #include <sys/random.h>
 #include <sys/types.h>
@@ -585,6 +586,31 @@ fd_topo_initialize( config_t * config ) {
   }
 
   FOR(execrp_tile_cnt) fd_topob_link( topo, "execrp_replay", "execrp_replay", 16384UL,                                  sizeof(fd_execrp_task_done_msg_t), 1UL );
+
+  /* arb_notify / arb_notify_rp 是命中通知环：execle 与 execrp tile 在交易
+     命中 arbfilter 时把命中的 key 与所属 accdb fork 发布出来，验证器内部
+     没有消费者，外部程序（`arb watch`）裸消费。link 必须声明
+     permit_no_consumers：没有声明可靠消费者的 link，stem 不会为它建立流控
+     表，fd_stem_publish 因此永不阻塞，发布不进关键路径。
+
+     mcache/dcache 与 arbfilter 同在 `arbfilter` 工作区，外部程序映射一次
+     工作区就能同时拿到过滤器、两条环的全部实例。mtu 必须取
+     sizeof(fd_arbnotify_t)，对象 id 写进 props 供外部程序定位。 */
+  FOR(execle_tile_cnt) {
+    fd_topo_link_t * link = fd_topob_link( topo, FD_ARBNOTIFY_LINK_LE, "arbfilter", FD_ARBNOTIFY_DEPTH, sizeof(fd_arbnotify_t), 1UL );
+    link->permit_no_consumers = 1;
+    FD_TEST( fd_pod_insertf_ulong( topo->props, link->mcache_obj_id, "arb_notify.%lu.mcache", i ) );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, link->dcache_obj_id, "arb_notify.%lu.dcache", i ) );
+  }
+  FD_TEST( fd_pod_insertf_ulong( topo->props, execle_tile_cnt, "arb_notify.cnt" ) );
+
+  FOR(execrp_tile_cnt) {
+    fd_topo_link_t * link = fd_topob_link( topo, FD_ARBNOTIFY_LINK_RP, "arbfilter", FD_ARBNOTIFY_DEPTH, sizeof(fd_arbnotify_t), 1UL );
+    link->permit_no_consumers = 1;
+    FD_TEST( fd_pod_insertf_ulong( topo->props, link->mcache_obj_id, "arb_notify_rp.%lu.mcache", i ) );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, link->dcache_obj_id, "arb_notify_rp.%lu.dcache", i ) );
+  }
+  FD_TEST( fd_pod_insertf_ulong( topo->props, execrp_tile_cnt, "arb_notify_rp.cnt" ) );
   if( FD_LIKELY( config->tiles.gui.enabled ) ) {
     fd_topob_link( topo, "diag_gui", "diag_gui", 4UL, sizeof(fd_diag_system_resources_t), 1UL );
     /**/                 fd_topob_link( topo, "gossip_gui",  "gossip_gui",    256UL,                                    FD_GUI_GOSSIP_BW_MTU,          1UL );
@@ -824,6 +850,7 @@ fd_topo_initialize( config_t * config ) {
 
   FOR(execrp_tile_cnt) fd_topob_tile_in (   topo, "execrp",  i,            "metric_in", "replay_execrp", i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   FOR(execrp_tile_cnt) fd_topob_tile_out(   topo, "execrp",  i,                         "execrp_replay", i                                                  );
+  FOR(execrp_tile_cnt) fd_topob_tile_out(   topo, "execrp",  i,                         FD_ARBNOTIFY_LINK_RP, i                                             );
 
   if( !alpenglow_enabled ) {
   if(leader_enabled)  {fd_topob_tile_in (   topo, "tower",   0UL,          "metric_in", "dedup_resolv",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );}
@@ -877,6 +904,7 @@ fd_topo_initialize( config_t * config ) {
     }
     FOR(execle_tile_cnt) fd_topob_tile_in ( topo, "execle",  i,            "metric_in", "pack_execle",   i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(execle_tile_cnt) fd_topob_tile_out( topo, "execle",  i,                         "execle_poh",    i                                                  );
+    FOR(execle_tile_cnt) fd_topob_tile_out( topo, "execle",  i,                         FD_ARBNOTIFY_LINK_LE, i                                             );
     if( FD_LIKELY( config->tiles.pack.use_consumed_cus ) ) {
       FOR(execle_tile_cnt)fd_topob_tile_out(topo, "execle",  i,                         "execle_pack",   i                                                  );
     }

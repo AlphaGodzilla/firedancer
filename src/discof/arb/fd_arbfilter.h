@@ -61,6 +61,13 @@
 #define FD_ARBFILTER_BIT_PROG_ACCOUNT (2UL) /* R2：过滤器中的程序出现在账户列表里 */
 #define FD_ARBFILTER_BIT_HOT_ACCOUNT (4UL) /* R3：触及了热池账户 */
 
+/* fd_arbfilter_hit_t 是一个命中的 key。fd_arbfilter_collect 把命中的 key
+   按判定顺序去重后写进这种元素的数组，调用方据此把 key 发布给下游。 */
+
+typedef struct {
+  uchar key[ 32UL ];
+} fd_arbfilter_hit_t;
+
 /* fd_arbfilter_ent 是一张 key 表里的一个槽：32 字节 key 加一个占用标志。
    两张表共用这个元素类型，探测逻辑因此只需要写一份。 */
 
@@ -89,12 +96,14 @@ struct fd_arbfilter_shmem {
 
   fd_arbfilter_ent_t acct[ FD_ARBFILTER_ACCT_SLOT_MAX ];
 
-  /* 由 execrp tile 写入，其它进程只读。这三个字段是普通计数器，用
-     relaxed 原子操作累加，热路径因此不需要加锁。stat_ns 目前恒为 0，
-     保留给匹配耗时的累计器。 */
+  /* 由 exec tile 写入，其它进程只读。这些字段是普通计数器，用 relaxed
+     原子操作累加，热路径因此不需要加锁。stat_ns 目前恒为 0，保留给匹配
+     耗时的累计器。stat_published 只统计命中后真的把记录发布到通知环的
+     交易，与 stat_emit 在同一处累加点上区分。 */
   ulong stat_emit;
   ulong stat_skip;
   ulong stat_ns;
+  ulong stat_published;
 };
 
 typedef struct fd_arbfilter_shmem fd_arbfilter_shmem_t;
@@ -201,8 +210,26 @@ ulong
 fd_arbfilter_acct_idx( fd_arbfilter_shmem_t const * f,
                        uchar const *                key );
 
-/* fd_arbfilter_match 用过滤器判定一笔交易，返回 FD_ARBFILTER_BIT_* 的
-   位掩码：
+/* arbfilter_hit_push 把 key 追加到 hits[0..*hit_cnt) 的尾部。已经在这个
+   前缀里的 key 不重复写入，因此同一笔交易反复触到同一个 key 时只留一份。
+   hits_cap 用尽后新 key 直接丢弃：截断只影响 key 列表，不影响匹配结论，
+   所以位掩码仍然完整。 */
+
+static inline void
+arbfilter_hit_push( fd_arbfilter_hit_t * hits,
+                    ulong *              hit_cnt,
+                    ulong                hits_cap,
+                    uchar const *        key ) {
+  ulong cnt = *hit_cnt;
+  for( ulong i=0UL; i<cnt; i++ ) if( FD_UNLIKELY( fd_memeq( hits[ i ].key, key, 32UL ) ) ) return;
+  if( FD_UNLIKELY( cnt>=hits_cap ) ) return;
+  fd_memcpy( hits[ cnt ].key, key, 32UL );
+  *hit_cnt = cnt+1UL;
+}
+
+/* fd_arbfilter_collect 用过滤器判定一笔交易，返回 FD_ARBFILTER_BIT_* 的
+   位掩码，同时把命中的 key 收集到 hits（判定规则与下面 fd_arbfilter_match
+   完全一致）：
 
      R1（PROG_DIRECT）：某条指令调用的程序在程序集合中；
      R2（PROG_ACCOUNT）：程序集合中的某个程序出现在账户列表里，即该
@@ -214,30 +241,39 @@ fd_arbfilter_acct_idx( fd_arbfilter_shmem_t const * f,
    步长紧密排列，acc_cnt 是其长度；accs 为 NULL 时改用交易的静态账户
    列表。用字节指针而不是 fd_acct_addr_t 指针，是为了让调用方能直接
    传入 fd_pubkey_t 数组而无需强制类型转换（那会触犯严格别名规则）。
- 
+
+   hits 按判定顺序接收命中的 key，去重，最多写 hits_cap 条，实际条数写
+   进 *hit_cnt；hits 为 NULL 时既不读也不写 hit_cnt，此时本函数就是纯判
+   定。超过 hits_cap 的命中只丢弃 key，位掩码不受影响。
 
    本函数运行在 exec 热路径上：不发起系统调用、不分配内存、不打日志、
    不加锁、不写共享内存。 */
 
 static inline ulong
-fd_arbfilter_match( fd_arbfilter_shmem_t const * f,
-                    fd_txn_t const *              txn,
-                    uchar const *                 payload,
-                    uchar const *                 accs,
-                    ulong                         acc_cnt ) {
+fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
+                      fd_txn_t const *             txn,
+                      uchar const *                payload,
+                      uchar const *                accs,
+                      ulong                        acc_cnt,
+                      fd_arbfilter_hit_t *         hits,
+                      ulong *                      hit_cnt,
+                      ulong                        hits_cap ) {
   if( FD_UNLIKELY( !accs ) ) {
     accs    = (uchar const *)fd_txn_get_acct_addrs( txn, payload );
     acc_cnt = (ulong)txn->acct_addr_cnt;
   }
 
   ulong bits = 0UL;
+  ulong cnt  = 0UL;
 
   /* R1：程序通过账户数组下标直接给出。 */
   for( ulong i=0UL; i<(ulong)txn->instr_cnt; i++ ) {
     ulong prog_idx = (ulong)txn->instr[ i ].program_id;
     if( FD_UNLIKELY( prog_idx>=acc_cnt ) ) continue; /* 交易数据不一致 */
-    if( FD_UNLIKELY( fd_arbfilter_prog_idx( f, accs + prog_idx*FD_TXN_ACCT_ADDR_SZ )!=ULONG_MAX ) ) {
+    uchar const * key = accs + prog_idx*FD_TXN_ACCT_ADDR_SZ;
+    if( FD_UNLIKELY( fd_arbfilter_prog_idx( filter, key )!=ULONG_MAX ) ) {
       bits |= FD_ARBFILTER_BIT_PROG_DIRECT;
+      if( FD_UNLIKELY( hits ) ) arbfilter_hit_push( hits, &cnt, hits_cap, key );
       break;
     }
   }
@@ -245,13 +281,30 @@ fd_arbfilter_match( fd_arbfilter_shmem_t const * f,
   /* R2/R3：对解析后的账户列表只遍历一遍。 */
   ulong want = FD_ARBFILTER_BIT_PROG_ACCOUNT | FD_ARBFILTER_BIT_HOT_ACCOUNT;
   for( ulong i=0UL; i<acc_cnt; i++ ) {
-    uchar const * key = accs + i*FD_TXN_ACCT_ADDR_SZ;
-    if( FD_UNLIKELY( fd_arbfilter_prog_idx( f, key )!=ULONG_MAX ) ) bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
-    if( FD_UNLIKELY( fd_arbfilter_acct_idx( f, key )!=ULONG_MAX ) ) bits |= FD_ARBFILTER_BIT_HOT_ACCOUNT;
+    uchar const * key     = accs + i*FD_TXN_ACCT_ADDR_SZ;
+    int           in_prog = fd_arbfilter_prog_idx( filter, key )!=ULONG_MAX;
+    int           in_acct = fd_arbfilter_acct_idx( filter, key )!=ULONG_MAX;
+    if( FD_UNLIKELY( in_prog ) ) bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
+    if( FD_UNLIKELY( in_acct ) ) bits |= FD_ARBFILTER_BIT_HOT_ACCOUNT;
+    if( FD_UNLIKELY( hits && ( in_prog || in_acct ) ) ) arbfilter_hit_push( hits, &cnt, hits_cap, key );
     if( FD_UNLIKELY( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|want ) ) ) break;
   }
 
+  if( FD_LIKELY( hits ) ) *hit_cnt = cnt;
   return bits;
+}
+
+/* fd_arbfilter_match 只给出判定结果：它是 fd_arbfilter_collect 不收集 key
+   的薄封装，命中规则与返回值逐位相同，供只需要「是否相关」的调用点使用。
+   本函数同样不发起系统调用、不分配内存、不打日志、不加锁、不写共享内存。 */
+
+static inline ulong
+fd_arbfilter_match( fd_arbfilter_shmem_t const * f,
+                    fd_txn_t const *              txn,
+                    uchar const *                 payload,
+                    uchar const *                 accs,
+                    ulong                         acc_cnt ) {
+  return fd_arbfilter_collect( f, txn, payload, accs, acc_cnt, NULL, NULL, 0UL );
 }
 
 FD_PROTOTYPES_END

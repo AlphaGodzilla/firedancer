@@ -14,6 +14,7 @@
 #include "../../flamenco/runtime/fd_runtime.h"
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../discof/arb/fd_arbfilter.h"
+#include "../../discof/arb/fd_arbnotify.h"
 #include "../../flamenco/progcache/fd_progcache_user.h"
 #include "../../flamenco/log_collector/fd_log_collector_base.h"
 #include <time.h>
@@ -58,6 +59,10 @@ struct fd_execle_tile {
 
   fd_execle_out_t out_poh[1];
   fd_execle_out_t out_pack[1];
+
+  /* 命中通知环：没有消费者，stem 不为它建立流控，发布不会阻塞本 tile。 */
+  fd_execle_out_t arb_notify[1];
+  ulong           arb_notify_seq;
 
   ulong                rebates_for_slot;
   ulong                rebate_tsorig;
@@ -406,13 +411,38 @@ handle_microblock( fd_execle_tile_t *  ctx,
        in finalize anyway. */
     fd_runtime_commit_txn( ctx->runtime, bank, txn_in, txn_out );
 
-    /* 与 replay 路径一致：提交后判定这笔交易，只累加统计，不向下游发布
-       任何内容。 */
-    ulong arb_matched = fd_arbfilter_match( ctx->arbfilter, TXN( txn ), txn->payload,
-                                            (uchar const *)txn_out->accounts.keys,
-                                            txn_out->accounts.cnt );
+    /* 与 replay 路径一致：提交后判定这笔交易。只有命中时才把命中的 key 与
+       所属 accdb fork 发布到 arb_notify 环，未命中路径只有两次原子加；该环
+       没有消费者，stem 不为其建立流控，发布不会阻塞本 tile。 */
+    fd_arbfilter_hit_t arb_hits[ FD_ARBNOTIFY_KEY_MAX ];
+    ulong              arb_hit_cnt = 0UL;
+    ulong              arb_matched = fd_arbfilter_collect( ctx->arbfilter, TXN( txn ), txn->payload,
+                                                           (uchar const *)txn_out->accounts.keys,
+                                                           txn_out->accounts.cnt,
+                                                           arb_hits, &arb_hit_cnt, FD_ARBNOTIFY_KEY_MAX );
     if( FD_LIKELY( arb_matched ) ) FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_emit, 1UL );
     else                           FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_skip, 1UL );
+
+    if( FD_UNLIKELY( arb_matched && arb_hit_cnt ) ) {
+      fd_txn_t const * arb_txn = TXN( txn );
+
+      /* generation 与 fork id 一起构成这笔交易执行时的 fork 坐标：fork 池
+         槽位被复用时 generation 递增，消费者据此判断记录是否已经陈旧。 */
+      fd_arbnotify_fill(
+          fd_chunk_to_laddr( ctx->arb_notify->mem, ctx->arb_notify->chunk ),
+          bank->f.slot, bank->bank_seq,
+          bank->accdb_fork_id.val,
+          fd_accdb_fork_gen( ctx->accdb, bank->accdb_fork_id ),
+          (ushort)arb_matched,
+          arb_txn->signature_cnt ? txn->payload + arb_txn->signature_off : NULL,
+          arb_hits, arb_hit_cnt );
+
+      fd_stem_publish( stem, ctx->arb_notify->idx, ctx->arb_notify_seq++, ctx->arb_notify->chunk,
+                       sizeof(fd_arbnotify_t), 0UL, 0UL, (ulong)fd_frag_meta_ts_comp( fd_tickcount() ) );
+      ctx->arb_notify->chunk = fd_dcache_compact_next( ctx->arb_notify->chunk, sizeof(fd_arbnotify_t),
+                                                       ctx->arb_notify->chunk0, ctx->arb_notify->wmark );
+      FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_published, 1UL );
+    }
 
     long const txn_end_ticks = fd_tickcount();
     last_ticks = txn_end_ticks;
@@ -868,6 +898,11 @@ unprivileged_init( fd_topo_t const *      topo,
 
   *ctx->out_poh = out1( topo, tile, "execle_poh" ); FD_TEST( ctx->out_poh->idx!=ULONG_MAX );
   *ctx->out_pack = out1( topo, tile, "execle_pack" );
+
+  /* 命中通知环：每个 execle tile 一条出链路，拓扑保证它一定存在。 */
+  *ctx->arb_notify = out1( topo, tile, FD_ARBNOTIFY_LINK_LE );
+  FD_TEST( ctx->arb_notify->idx!=ULONG_MAX );
+  ctx->arb_notify_seq = 0UL;
 
   ctx->enable_rebates = ctx->out_pack->idx!=ULONG_MAX;
 

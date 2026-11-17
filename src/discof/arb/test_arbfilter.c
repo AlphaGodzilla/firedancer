@@ -1,4 +1,5 @@
 #include "fd_arbfilter.h"
+#include "fd_arbnotify.h"
 
 #include <string.h>
 #if FD_HAS_THREADS
@@ -50,7 +51,7 @@ test_new_join( void * mem ) {
   FD_TEST( f->prog_cnt==0UL );
   FD_TEST( f->acct_mask==FD_ARBFILTER_ACCT_SLOT_MAX-1UL );
   FD_TEST( f->acct_cnt==0UL );
-  FD_TEST( f->stat_emit==0UL && f->stat_skip==0UL && f->stat_ns==0UL );
+  FD_TEST( f->stat_emit==0UL && f->stat_skip==0UL && f->stat_ns==0UL && f->stat_published==0UL );
 
   /* 未格式化的内存与错位的指针都必须被 join 拒绝。 */
   FD_TEST( !fd_arbfilter_join( NULL ) );
@@ -302,6 +303,124 @@ test_match_empty( void * mem ) {
   FD_TEST( fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 3UL )==0UL );
 }
 
+/* test_collect 验证 fd_arbfilter_collect 的 key 收集：位掩码与
+   fd_arbfilter_match 完全一致，命中的 key 按判定顺序去重写进 hits，容量不
+   够时只截断 key 列表。 */
+
+static void
+test_collect( void * mem ) {
+  fd_arbfilter_shmem_t * f = fd_arbfilter_join( fd_arbfilter_new( mem ) );
+  FD_TEST( f );
+
+  uchar prog_key[ 2UL ][ 32UL ];
+  uchar hot_key [ 2UL ][ 32UL ];
+  uchar pad_key [ 32UL ];
+  test_key( prog_key[ 0 ], 60UL, 91U );
+  test_key( prog_key[ 1 ], 61UL, 91U );
+  test_key( hot_key [ 0 ], 62UL, 91U );
+  test_key( hot_key [ 1 ], 63UL, 91U );
+  test_key( pad_key,       64UL, 91U );
+
+  FD_TEST( fd_arbfilter_prog_set( f, 2UL, (uchar const (*)[32UL])prog_key )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, 2UL, (uchar const (*)[32UL])hot_key  )==0 );
+
+  /* 账户列表：[0]=付款方 [1]=程序成员 [2][3]=热账户 [4]=与 [1] 重复的 key。 */
+  fd_acct_addr_t accs[ 5UL ];
+  memset( accs, 0, sizeof(accs) );
+  memcpy( accs[ 0 ].b, pad_key,       32UL );
+  memcpy( accs[ 1 ].b, prog_key[ 0 ], 32UL );
+  memcpy( accs[ 2 ].b, hot_key[ 0 ],  32UL );
+  memcpy( accs[ 3 ].b, hot_key[ 1 ],  32UL );
+  memcpy( accs[ 4 ].b, prog_key[ 0 ], 32UL );
+
+  uchar txn_mem[ 512UL ] __attribute__((aligned(alignof(fd_txn_t))));
+  fd_txn_t * txn = test_txn_init( txn_mem, 1UL, 5UL );
+
+  fd_arbfilter_hit_t hits[ 8UL ];
+  ulong              hit_cnt = 0UL;
+  memset( hits, 0xAA, sizeof(hits) );
+
+  /* 顶层指令调用付款方：只有 R2/R3 成立，命中 3 个不重复的 key。 */
+  txn->instr[ 0 ].program_id = 0U;
+  ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL, hits, &hit_cnt, 8UL );
+  FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
+  FD_TEST( bits==fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 5UL ) );
+  FD_TEST( hit_cnt==3UL );
+  FD_TEST( !memcmp( hits[ 0 ].key, prog_key[ 0 ], 32UL ) );
+  FD_TEST( !memcmp( hits[ 1 ].key, hot_key[ 0 ],  32UL ) );
+  FD_TEST( !memcmp( hits[ 2 ].key, hot_key[ 1 ],  32UL ) );
+  FD_TEST( hits[ 3 ].key[ 0 ]==0xAA ); /* 有效条数之外不写 */
+
+  /* 顶层指令直调程序成员：R1 的 key 先入列，后面重复出现时不再追加。 */
+  txn->instr[ 0 ].program_id = 1U;
+  hit_cnt = 0UL;
+  bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL, hits, &hit_cnt, 8UL );
+  FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
+  FD_TEST( hit_cnt==3UL );
+  FD_TEST( !memcmp( hits[ 0 ].key, prog_key[ 0 ], 32UL ) );
+
+  /* 容量只有 2 条：key 列表截断，位掩码不受影响。 */
+  hit_cnt = 0UL;
+  bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL, hits, &hit_cnt, 2UL );
+  FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
+  FD_TEST( hit_cnt==2UL );
+
+  /* 不收集 key 时结果与 fd_arbfilter_match 相同。 */
+  FD_TEST( fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL, NULL, NULL, 0UL )
+           ==fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 5UL ) );
+
+  /* 未命中：不写任何 key。 */
+  fd_acct_addr_t none[ 1UL ];
+  memset( none, 0, sizeof(none) );
+  txn->instr[ 0 ].program_id = 0U;
+  hit_cnt = 99UL;
+  FD_TEST( fd_arbfilter_collect( f, txn, NULL, (uchar const *)none, 1UL, hits, &hit_cnt, 8UL )==0UL );
+  FD_TEST( hit_cnt==0UL );
+}
+
+/* test_notify_fill 验证通知记录的字段落位与截断：key_cnt 与实际写入的条数
+   一致，未用到的 key 槽、填充字节与缺省签名都是确定的 0。 */
+
+static void
+test_notify_fill( void ) {
+  FD_TEST( sizeof(fd_arbnotify_t)==352UL );
+  FD_TEST( sizeof(fd_arbnotify_t)%8UL==0UL );
+
+  fd_arbfilter_hit_t hits[ FD_ARBNOTIFY_KEY_MAX+2UL ];
+  for( ulong i=0UL; i<FD_ARBNOTIFY_KEY_MAX+2UL; i++ ) test_key( hits[ i ].key, 70UL+i, 97U );
+
+  uchar sig[ 64UL ];
+  for( ulong i=0UL; i<64UL; i++ ) sig[ i ] = (uchar)i;
+
+  fd_arbnotify_t rec[1];
+  memset( rec, 0xFF, sizeof(fd_arbnotify_t) );
+
+  fd_arbnotify_t * ret = fd_arbnotify_fill( rec, 12345UL, 7UL, (ushort)3U, 0U, (ushort)0x6U, sig, hits, 3UL );
+  FD_TEST( ret==rec );
+  FD_TEST( rec->slot==12345UL );
+  FD_TEST( rec->bank_seq==7UL );
+  FD_TEST( rec->accdb_fork_id==3U );
+  FD_TEST( rec->accdb_generation==0U );
+  FD_TEST( rec->matched==0x6U );
+  FD_TEST( rec->key_cnt==3UL );
+  FD_TEST( !memcmp( rec->sig, sig, 64UL ) );
+  for( ulong i=0UL; i<3UL; i++ ) FD_TEST( !memcmp( rec->keys[ i ], hits[ i ].key, 32UL ) );
+
+  /* fill 先清零整条记录：容量之外的 key 槽与填充字节都是 0。 */
+  for( ulong i=3UL; i<FD_ARBNOTIFY_KEY_MAX; i++ ) {
+    for( ulong j=0UL; j<32UL; j++ ) FD_TEST( !rec->keys[ i ][ j ] );
+  }
+  FD_TEST( !rec->_pad[ 0 ] && !rec->_pad[ 1 ] && !rec->_pad[ 2 ] );
+
+  /* 超过上限只写满 FD_ARBNOTIFY_KEY_MAX 条，key_cnt 报上限。 */
+  ret = fd_arbnotify_fill( rec, 1UL, 2UL, (ushort)0U, 0U, (ushort)0x2U, NULL, hits, FD_ARBNOTIFY_KEY_MAX+2UL );
+  FD_TEST( ret->key_cnt==FD_ARBNOTIFY_KEY_MAX );
+  for( ulong i=0UL; i<FD_ARBNOTIFY_KEY_MAX; i++ ) FD_TEST( !memcmp( rec->keys[ i ], hits[ i ].key, 32UL ) );
+
+  /* sig 为 NULL 时签名区写全 0。 */
+  for( ulong i=0UL; i<64UL; i++ ) FD_TEST( !rec->sig[ i ] );
+}
+
 
 /* test_probe_bound 钉住热路径代价：把两张表都装到可配置条目上限（装载率
    0.5），断言未命中查询的探测次数仍是个位数量级，而不是扫完整张表。
@@ -463,6 +582,8 @@ main( int     argc,
   test_acct_set       ( mem );
   test_match          ( mem );
   test_match_empty    ( mem );
+  test_collect        ( mem );
+  test_notify_fill    ( );
   test_probe_bound    ( mem );
   test_stuck_writer   ( mem );
 #if FD_HAS_THREADS

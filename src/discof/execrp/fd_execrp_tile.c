@@ -5,6 +5,7 @@
 #include "../../choreo/tower/fd_tower_serdes.h"
 #include "../../discof/fd_startup.h"
 #include "../../discof/arb/fd_arbfilter.h"
+#include "../../discof/arb/fd_arbnotify.h"
 #include "../../discof/replay/fd_execrp.h"
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/runtime/fd_txncache.h"
@@ -46,6 +47,10 @@ struct fd_execrp_tile {
   /* link-related data structures. */
   link_ctx_t            replay_in[ 1 ];
   link_ctx_t            execrp_replay_out[ 1 ]; /* TODO: Remove with solcap v2 */
+
+  /* 命中通知环：没有消费者，stem 不为它建立流控，发布不会阻塞本 tile。 */
+  link_ctx_t            arb_notify[ 1 ];
+  ulong                 arb_notify_seq;
 
   fd_sha512_t           sha_mem[ FD_TXN_SIG_MAX ];
   fd_sha512_t *         sha_lj[  FD_TXN_SIG_MAX ];
@@ -241,14 +246,40 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
     FD_LOG_WARNING(( "block marked dead (slot=%lu) because of invalid transaction (signature=%s) (txn_err=%d)", ctx->slot, signature_b58, ctx->txn_out.err.txn_err ));
   }
 
-  /* 用 arbfilter 判定这笔已执行完的交易。这里只读过滤器表并累加一次
-     计数：不打日志、不分配内存、不发起系统调用。判定结果只进入统计，
-     不向下游发布任何内容。 */
-  ulong matched = fd_arbfilter_match( ctx->arbfilter, TXN( ctx->txn_in.txn ), ctx->txn_in.txn->payload,
-                                      (uchar const *)ctx->txn_out.accounts.keys,
-                                      ctx->txn_out.accounts.cnt );
+  /* 用 arbfilter 判定这笔已执行完的交易。判定本身只读过滤器表并累加一次
+     计数；只有命中时才把命中的 key 与所属 accdb fork 发布到 arb_notify
+     环，未命中路径因此只有两次原子加。发布环没有消费者，stem 不为其建
+     立流控，发布不会阻塞本 tile。 */
+  fd_arbfilter_hit_t arb_hits[ FD_ARBNOTIFY_KEY_MAX ];
+  ulong              arb_hit_cnt = 0UL;
+  ulong              matched     = fd_arbfilter_collect(
+      ctx->arbfilter, TXN( ctx->txn_in.txn ), ctx->txn_in.txn->payload,
+      (uchar const *)ctx->txn_out.accounts.keys, ctx->txn_out.accounts.cnt,
+      arb_hits, &arb_hit_cnt, FD_ARBNOTIFY_KEY_MAX );
   if( FD_LIKELY( matched ) ) FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_emit, 1UL );
   else                       FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_skip, 1UL );
+
+  if( FD_UNLIKELY( matched && arb_hit_cnt ) ) {
+    fd_txn_t const * arb_txn = TXN( ctx->txn_in.txn );
+
+    /* generation 与 fork id 一起构成这笔交易执行时的 fork 坐标：fork 池槽
+       位被复用时 generation 递增，消费者据此判断记录是否已经陈旧。 */
+    fd_arbnotify_fill(
+        fd_chunk_to_laddr( ctx->arb_notify->mem, ctx->arb_notify->chunk ),
+        ctx->bank->f.slot, ctx->bank->bank_seq,
+        ctx->bank->accdb_fork_id.val,
+        fd_accdb_fork_gen( ctx->accdb, ctx->bank->accdb_fork_id ),
+        (ushort)matched,
+        arb_txn->signature_cnt ? ctx->txn_in.txn->payload + arb_txn->signature_off : NULL,
+        arb_hits, arb_hit_cnt );
+
+    fd_stem_publish( stem, ctx->arb_notify->idx, ctx->arb_notify_seq++,
+                     ctx->arb_notify->chunk, sizeof(fd_arbnotify_t),
+                     0UL, 0UL, (ulong)fd_frag_meta_ts_comp( fd_tickcount() ) );
+    ctx->arb_notify->chunk = fd_dcache_compact_next( ctx->arb_notify->chunk, sizeof(fd_arbnotify_t),
+                                                     ctx->arb_notify->chunk0, ctx->arb_notify->wmark );
+    FD_ATOMIC_FETCH_AND_ADD( &ctx->arbfilter->stat_published, 1UL );
+  }
 
   fd_stem_publish( stem, ctx->execrp_replay_out->idx, (FD_EXECRP_TT_TXN_EXEC<<32)|ctx->tile_idx, ctx->execrp_replay_out->chunk, sizeof(*msg), 0UL, ctx->dispatch_time_comp, fd_frag_meta_ts_comp( fd_tickcount() ) );
 
@@ -473,6 +504,16 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->execrp_replay_out->wmark  = fd_dcache_compact_wmark( ctx->execrp_replay_out->mem, execrp_replay_link->dcache, execrp_replay_link->mtu );
     ctx->execrp_replay_out->chunk  = ctx->execrp_replay_out->chunk0;
   }
+
+  /* 命中通知环：每个 execrp tile 一条出链路，拓扑保证它一定存在。 */
+  ctx->arb_notify->idx = fd_topo_find_tile_out_link( topo, tile, FD_ARBNOTIFY_LINK_RP, ctx->tile_idx );
+  FD_TEST( ctx->arb_notify->idx!=ULONG_MAX );
+  fd_topo_link_t const * arb_notify_link = &topo->links[ tile->out_link_id[ ctx->arb_notify->idx ] ];
+  ctx->arb_notify->mem    = topo->workspaces[ topo->objs[ arb_notify_link->dcache_obj_id ].wksp_id ].wksp;
+  ctx->arb_notify->chunk0 = fd_dcache_compact_chunk0( ctx->arb_notify->mem, arb_notify_link->dcache );
+  ctx->arb_notify->wmark  = fd_dcache_compact_wmark( ctx->arb_notify->mem, arb_notify_link->dcache, arb_notify_link->mtu );
+  ctx->arb_notify->chunk  = ctx->arb_notify->chunk0;
+  ctx->arb_notify_seq     = 0UL;
 
   ctx->capture_ctx = NULL;
   if( FD_UNLIKELY( strlen( tile->execrp.solcap_capture ) ) ) {
