@@ -404,34 +404,34 @@ test_collect( void * mem ) {
   ulong              hit_cnt = 0UL;
   memset( hits, 0xAA, sizeof(hits) );
 
-  /* 顶层指令调用付款方：只有 R2/R3 成立，命中 3 个不重复的 key。三个提交
-     判据掩码都传 NULL、commit_ok=1，提交集不设限，收集只由命中决定。 */
+  /* 顶层指令调用付款方：R1 不成立，程序成员靠出现在静态账户列表里让 R2 成立，
+     短路因此放行；热账户表命中 2 个可提交账户。程序成员本身只算程序命中，不进
+     keys[]（keys[] 只放会被提交的账户）。 */
   txn->instr[ 0 ].program_id = 0U;
   ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL,
                                      NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
   FD_TEST( bits==fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 5UL ) );
-  FD_TEST( hit_cnt==3UL );
-  FD_TEST( !memcmp( hits[ 0 ].key, prog_key[ 0 ], 32UL ) );
-  FD_TEST( !memcmp( hits[ 1 ].key, hot_key[ 0 ],  32UL ) );
-  FD_TEST( !memcmp( hits[ 2 ].key, hot_key[ 1 ],  32UL ) );
-  FD_TEST( hits[ 3 ].key[ 0 ]==0xAA ); /* 有效条数之外不写 */
+  FD_TEST( hit_cnt==2UL );
+  FD_TEST( !memcmp( hits[ 0 ].key, hot_key[ 0 ],  32UL ) );
+  FD_TEST( !memcmp( hits[ 1 ].key, hot_key[ 1 ],  32UL ) );
+  FD_TEST( hits[ 2 ].key[ 0 ]==0xAA ); /* 有效条数之外不写 */
 
-  /* 顶层指令直调程序成员：R1 的 key 先入列，后面重复出现时不再追加。 */
+  /* 顶层指令直调程序成员：R1 成立，位掩码多一位，keys[] 仍是那两个热账户。 */
   txn->instr[ 0 ].program_id = 1U;
   hit_cnt = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL,
                                NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 8UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
-  FD_TEST( hit_cnt==3UL );
-  FD_TEST( !memcmp( hits[ 0 ].key, prog_key[ 0 ], 32UL ) );
+  FD_TEST( hit_cnt==2UL );
+  FD_TEST( !memcmp( hits[ 0 ].key, hot_key[ 0 ], 32UL ) );
 
-  /* 容量只有 2 条：key 列表截断，位掩码不受影响。 */
+  /* 容量只有 1 条：key 列表截断，位掩码不受影响。 */
   hit_cnt = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL,
-                               NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 2UL );
+                               NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, NULL, NULL, 0UL, 1UL );
   FD_TEST( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT ) );
-  FD_TEST( hit_cnt==2UL );
+  FD_TEST( hit_cnt==1UL );
 
   /* 不收集 key 时结果与 fd_arbfilter_match 相同。 */
   FD_TEST( fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 5UL,
