@@ -1088,12 +1088,96 @@ bench_one( char const *    name,
                   (ulong)found, (ulong)LOOKUP_CNT ));
 }
 
+/* bench_collect 量「一笔交易走完三轮过滤」的实际耗时，而不是单次查找的价格：
+   前两轮查的是程序表（128 槽，全在 L1），第三轮查的是热账户表（2048 槽，68 KiB，
+   主要在 L2），所以单次查找的 ns 不能直接乘次数。
+
+   两个场景各量一次：
+     miss  第①②轮都没命中关注程序 → 短路返回，第三轮一次都不探测
+     hit   第②轮命中程序、第③轮在 4 个可提交账户里命中 1 个热账户 */
+
 static void
-bench_all( void ) {
+bench_collect( void * mem ) {
+  fd_arbfilter_shmem_t * f = fd_arbfilter_join( fd_arbfilter_new( mem ) );
+  FD_TEST( f );
+
+  enum { PROG_CNT = 64UL, ACCT_CNT = 512UL, ACCT_TOTAL = 20UL, LOOKUPS = 1000000UL };
+
+  /* 两张表都按生产的装载率 0.5 装。 */
+  uchar prog_key[ PROG_CNT ][ 32UL ];
+  uchar acct_key[ ACCT_CNT ][ 32UL ];
+  for( ulong i=0UL; i<PROG_CNT; i++ ) test_key( prog_key[ i ], 300UL+i, 151U );
+  for( ulong i=0UL; i<ACCT_CNT; i++ ) test_key( acct_key[ i ], 400UL+i, 151U );
+  FD_TEST( fd_arbfilter_prog_set( f, PROG_CNT, (uchar const (*)[32UL])prog_key, NULL )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, ACCT_CNT, (uchar const (*)[32UL])acct_key, NULL )==0 );
+
+  /* 一笔典型的 DeFi 交易：20 个静态账户、2 条指令、4 个可提交可写账户。
+     账户 [1] 是关注程序（CPI 形态），账户 [2] 是热账户，其余是无关账户。 */
+  uchar accs[ ACCT_TOTAL ][ 32UL ];
+  for( ulong i=0UL; i<ACCT_TOTAL; i++ ) test_key( accs[ i ], 500UL+i, 151U );
+  memcpy( accs[ 1 ], prog_key[ 3 ], 32UL );
+  memcpy( accs[ 2 ], acct_key[ 7 ], 32UL );
+
+  uchar writable[ ACCT_TOTAL ];
+  uchar touched [ ACCT_TOTAL ];
+  uchar acquired[ ACCT_TOTAL ];
+  memset( writable, 0, sizeof(writable) );
+  memset( touched,  0, sizeof(touched ) );
+  memset( acquired, 0, sizeof(acquired) );
+  for( ulong i=0UL; i<4UL; i++ ) { writable[ i ]=1U; touched[ i ]=1U; acquired[ i ]=1U; }
+  writable[ 2 ] = 1U; /* 热账户可提交 */
+  touched [ 2 ] = 1U;
+  acquired[ 2 ] = 1U;
+
+  uchar txn_mem[ 512UL ] __attribute__((aligned(alignof(fd_txn_t))));
+  fd_txn_t * txn = test_txn_init( txn_mem, 2UL, ACCT_TOTAL );
+  txn->instr[ 0 ].program_id = 0U; /* 付款方，不在程序表里 */
+  txn->instr[ 1 ].program_id = 0U;
+
+  fd_arbfilter_hit_t hits[ FD_ARBNOTIFY_KEY_MAX ];
+  struct timespec t0, t1;
+  ulong sink = 0UL;
+
+  /* 场景 1：全部命中程序（账户 [1] 是关注程序），第三轮探 4 个账户。 */
+  clock_gettime( CLOCK_MONOTONIC, &t0 );
+  for( ulong n=0UL; n<LOOKUPS; n++ ) {
+    ulong cnt = 0UL, more = 0UL, emitted = 0UL;
+    sink += fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, ACCT_TOTAL,
+                                  writable, touched, acquired, 1,
+                                  &emitted, hits, &cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
+    sink += cnt;
+  }
+  clock_gettime( CLOCK_MONOTONIC, &t1 );
+  double ns_hit = ( (double)( t1.tv_sec - t0.tv_sec )*1e9 + (double)( t1.tv_nsec - t0.tv_nsec ) ) / (double)LOOKUPS;
+
+  /* 场景 2：把关注程序账户换掉，第①②轮都不命中 → 短路。 */
+  memcpy( accs[ 1 ], accs[ 5 ], 32UL );
+  clock_gettime( CLOCK_MONOTONIC, &t0 );
+  for( ulong n=0UL; n<LOOKUPS; n++ ) {
+    ulong cnt = 0UL, more = 0UL, emitted = 0UL;
+    sink += fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, ACCT_TOTAL,
+                                  writable, touched, acquired, 1,
+                                  &emitted, hits, &cnt, &more, NULL, NULL, 0UL, FD_ARBNOTIFY_KEY_MAX );
+    sink += cnt;
+  }
+  clock_gettime( CLOCK_MONOTONIC, &t1 );
+  double ns_miss = ( (double)( t1.tv_sec - t0.tv_sec )*1e9 + (double)( t1.tv_nsec - t0.tv_nsec ) ) / (double)LOOKUPS;
+
+  FD_TEST( sink!=ULONG_MAX ); /* 防止整个循环被优化掉 */
+
+  FD_LOG_NOTICE(( "TRANSACTION 三轮全走（程序命中 + 4 个可提交账户）: %6.1f ns", ns_hit ));
+  FD_LOG_NOTICE(( "TRANSACTION 短路返回（程序表未命中）:                 %6.1f ns", ns_miss ));
+
+  (void)mem;
+}
+
+static void
+bench_all( void * mem ) {
   bench_one( "FNV-1a + fd_memeq",   bench_hash_fnv,  bench_eq_cmpsb );
   bench_one( "FNV-1a + 字比较",     bench_hash_fnv,  bench_eq_words );
   bench_one( "fd_hash32 + fd_memeq",bench_hash_fd32, bench_eq_cmpsb );
   bench_one( "fd_hash32 + 字比较",  bench_hash_fd32, bench_eq_words );
+  bench_collect( mem );
 }
 
 int
@@ -1103,7 +1187,10 @@ main( int     argc,
 
   /* 微基准不依赖工作区，单独一条路径，不进 CI 的常规执行。 */
   if( argc>1 && !strcmp( argv[ 1 ], "bench" ) ) {
-    bench_all();
+    /* 三轮过滤要一块格式化的过滤器内存，借用工作区之前先自己 new 一块普通内存。 */
+    static uchar bench_mem[ 1UL<<20 ] __attribute__((aligned(4096)));
+    memset( bench_mem, 0, sizeof(bench_mem) );
+    bench_all( bench_mem );
     fd_halt();
     return 0;
   }
