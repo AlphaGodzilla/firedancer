@@ -244,7 +244,8 @@ arbfilter_hit_push( fd_arbfilter_hit_t * hits,
 
    hits 按判定顺序接收命中的 key，去重，最多写 hits_cap 条，实际条数写
    进 *hit_cnt；hits 为 NULL 时既不读也不写 hit_cnt，此时本函数就是纯判
-   定。超过 hits_cap 的命中只丢弃 key，位掩码不受影响。
+   定。超过 hits_cap 的命中只丢弃 key，位掩码不受影响。收集 key 时必须扫完
+   整个账户列表而不提前退出，否则同一笔交易触到的后续关注 key 会丢失。
 
    本函数运行在 exec 热路径上：不发起系统调用、不分配内存、不打日志、
    不加锁、不写共享内存。 */
@@ -287,7 +288,9 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
     if( FD_UNLIKELY( in_prog ) ) bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
     if( FD_UNLIKELY( in_acct ) ) bits |= FD_ARBFILTER_BIT_HOT_ACCOUNT;
     if( FD_UNLIKELY( hits && ( in_prog || in_acct ) ) ) arbfilter_hit_push( hits, &cnt, hits_cap, key );
-    if( FD_UNLIKELY( bits==( FD_ARBFILTER_BIT_PROG_DIRECT|want ) ) ) break;
+    /* 只有纯判定（hits 为 NULL）时才提前退出：收集 key 的调用方要拿到这
+       笔交易触到的全部关注 key，提前退出会让后面的命中丢失。 */
+    if( FD_UNLIKELY( !hits && bits==( FD_ARBFILTER_BIT_PROG_DIRECT|want ) ) ) break;
   }
 
   if( FD_LIKELY( hits ) ) *hit_cnt = cnt;
