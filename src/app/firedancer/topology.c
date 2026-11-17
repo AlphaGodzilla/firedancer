@@ -595,7 +595,10 @@ fd_topo_initialize( config_t * config ) {
 
      mcache/dcache 与 arbfilter 同在 `arbfilter` 工作区，外部程序映射一次
      工作区就能同时拿到过滤器、两条环的全部实例。mtu 必须取
-     sizeof(fd_arbnotify_t)，对象 id 写进 props 供外部程序定位。 */
+     sizeof(fd_arbnotify_t)，对象 id 写进 props 供外部程序定位。
+
+     rec_sz 是记录尺寸的独立副本：记录是定长裸布局，外部读者在解读记录前必须
+     用它与自己的 sizeof(fd_arbnotify_t) 比对，不符说明两边来自不同的构建。 */
   FOR(execle_tile_cnt) {
     fd_topo_link_t * link = fd_topob_link( topo, FD_ARBNOTIFY_LINK_LE, "arbfilter", FD_ARBNOTIFY_DEPTH, sizeof(fd_arbnotify_t), 1UL );
     link->permit_no_consumers = 1;
@@ -603,6 +606,7 @@ fd_topo_initialize( config_t * config ) {
     FD_TEST( fd_pod_insertf_ulong( topo->props, link->dcache_obj_id, "arb_notify.%lu.dcache", i ) );
   }
   FD_TEST( fd_pod_insertf_ulong( topo->props, execle_tile_cnt, "arb_notify.cnt" ) );
+  FD_TEST( fd_pod_insertf_ulong( topo->props, sizeof(fd_arbnotify_t), "arb_notify.rec_sz" ) );
 
   FOR(execrp_tile_cnt) {
     fd_topo_link_t * link = fd_topob_link( topo, FD_ARBNOTIFY_LINK_RP, "arbfilter", FD_ARBNOTIFY_DEPTH, sizeof(fd_arbnotify_t), 1UL );
@@ -611,6 +615,7 @@ fd_topo_initialize( config_t * config ) {
     FD_TEST( fd_pod_insertf_ulong( topo->props, link->dcache_obj_id, "arb_notify_rp.%lu.dcache", i ) );
   }
   FD_TEST( fd_pod_insertf_ulong( topo->props, execrp_tile_cnt, "arb_notify_rp.cnt" ) );
+  FD_TEST( fd_pod_insertf_ulong( topo->props, sizeof(fd_arbnotify_t), "arb_notify_rp.rec_sz" ) );
   if( FD_LIKELY( config->tiles.gui.enabled ) ) {
     fd_topob_link( topo, "diag_gui", "diag_gui", 4UL, sizeof(fd_diag_system_resources_t), 1UL );
     /**/                 fd_topob_link( topo, "gossip_gui",  "gossip_gui",    256UL,                                    FD_GUI_GOSSIP_BW_MTU,          1UL );

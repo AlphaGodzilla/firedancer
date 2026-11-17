@@ -14,18 +14,20 @@ FD_STATIC_ASSERT( FD_ARBFILTER_PROG_ENTRY_MAX>0UL,                              
 FD_STATIC_ASSERT( FD_ARBFILTER_PROG_ENTRY_MAX*2UL<=FD_ARBFILTER_PROG_SLOT_MAX, prog_load_factor );
 FD_STATIC_ASSERT( FD_ARBFILTER_ACCT_ENTRY_MAX*2UL<=FD_ARBFILTER_ACCT_SLOT_MAX, acct_load_factor );
 
-/* arbfilter_tbl_insert 把 key 放进表里，重复的 key 只存一份。返回 1 表示
-   占用了新槽，0 表示 key 已经在表里。槽数不小于待插入 key 上限时循环一定
-   能找到空槽，因此不会丢 key。 */
+/* arbfilter_tbl_insert 把 key 与它的 tag 放进表里，重复的 key 只存一份且首个
+   出现的 tag 生效。返回 1 表示占用了新槽，0 表示 key 已经在表里（tag 保持
+   不变）。槽数不小于待插入 key 上限时循环一定能找到空槽，因此不会丢 key。 */
 
 static inline int
 arbfilter_tbl_insert( fd_arbfilter_ent_t * ent,
                       ulong                mask,
-                      uchar const *        key ) {
+                      uchar const *        key,
+                      uchar                tag ) {
   ulong idx = arbfilter_hash( key ) & mask;
   for( ulong probe=0UL; probe<=mask; probe++ ) {
     if( FD_LIKELY( !ent[ idx ].used ) ) {
       memcpy( ent[ idx ].key, key, 32UL );
+      ent[ idx ].tag  = tag;
       ent[ idx ].used = 1;
       return 1;
     }
@@ -137,7 +139,8 @@ fd_arbfilter_join( void * shmem ) {
 int
 fd_arbfilter_prog_set( fd_arbfilter_shmem_t * f,
                        ulong                  cnt,
-                       uchar const            (*ids)[ 32UL ] ) {
+                       uchar const            (*ids)[ 32UL ],
+                       uchar const *          tags ) {
   if( FD_UNLIKELY( cnt>FD_ARBFILTER_PROG_ENTRY_MAX ) ) return -1;
 
   ulong ver  = arbfilter_ver_begin( f );
@@ -149,7 +152,8 @@ fd_arbfilter_prog_set( fd_arbfilter_shmem_t * f,
   memset( f->prog, 0, sizeof(f->prog) );
 
   ulong used = 0UL;
-  for( ulong i=0UL; i<cnt; i++ ) used += (ulong)arbfilter_tbl_insert( f->prog, mask, ids[ i ] );
+  for( ulong i=0UL; i<cnt; i++ )
+    used += (ulong)arbfilter_tbl_insert( f->prog, mask, ids[ i ], tags ? tags[ i ] : 0U );
 
   f->prog_cnt = used;
   arbfilter_ver_end( f, ver );
@@ -159,7 +163,8 @@ fd_arbfilter_prog_set( fd_arbfilter_shmem_t * f,
 int
 fd_arbfilter_acct_set( fd_arbfilter_shmem_t * f,
                        ulong                  cnt,
-                       uchar const            (*keys)[ 32UL ] ) {
+                       uchar const            (*keys)[ 32UL ],
+                       uchar const *          tags ) {
   if( FD_UNLIKELY( cnt>FD_ARBFILTER_ACCT_ENTRY_MAX ) ) return -1;
 
   ulong ver  = arbfilter_ver_begin( f );
@@ -169,7 +174,8 @@ fd_arbfilter_acct_set( fd_arbfilter_shmem_t * f,
   memset( f->acct, 0, sizeof(f->acct) );
 
   ulong used = 0UL;
-  for( ulong i=0UL; i<cnt; i++ ) used += (ulong)arbfilter_tbl_insert( f->acct, mask, keys[ i ] );
+  for( ulong i=0UL; i<cnt; i++ )
+    used += (ulong)arbfilter_tbl_insert( f->acct, mask, keys[ i ], tags ? tags[ i ] : 0U );
 
   f->acct_cnt = used;
   arbfilter_ver_end( f, ver );

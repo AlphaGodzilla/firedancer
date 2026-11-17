@@ -91,7 +91,7 @@ test_prog_set( void * mem ) {
   /* 逐个加入，每次全部成员都能查到、未加入的都查不到。槽号是哈希探测
      结果，与写入顺序无关，因此只断言命中与否。 */
   for( ulong cnt=1UL; cnt<=FD_ARBFILTER_PROG_ENTRY_MAX; cnt++ ) {
-    FD_TEST( fd_arbfilter_prog_set( f, cnt, (uchar const (*)[32UL])ids )==0 );
+    FD_TEST( fd_arbfilter_prog_set( f, cnt, (uchar const (*)[32UL])ids, NULL )==0 );
     FD_TEST( f->prog_cnt==cnt );
     ver = test_check_version( f, ver );
     for( ulong i=0UL; i<cnt; i++ )         FD_TEST( fd_arbfilter_prog_idx( f, ids[ i ] )!=ULONG_MAX );
@@ -103,33 +103,60 @@ test_prog_set( void * mem ) {
   for( ulong i=0UL; i<FD_ARBFILTER_PROG_ENTRY_MAX; i++ ) FD_TEST( fd_arbfilter_prog_idx( f, ids[ i ] )!=ULONG_MAX );
 
   /* 越界：返回 -1 且表保持原样。 */
-  FD_TEST( fd_arbfilter_prog_set( f, FD_ARBFILTER_PROG_ENTRY_MAX+1UL, (uchar const (*)[32UL])ids )==-1 );
+  FD_TEST( fd_arbfilter_prog_set( f, FD_ARBFILTER_PROG_ENTRY_MAX+1UL, (uchar const (*)[32UL])ids, NULL )==-1 );
   FD_TEST( f->prog_cnt==FD_ARBFILTER_PROG_ENTRY_MAX );
   FD_TEST( fd_arbfilter_prog_idx( f, ids[ FD_ARBFILTER_PROG_ENTRY_MAX-1UL ] )!=ULONG_MAX );
   FD_TEST( f->version==ver );
 
-  /* 重复 id 只存一份。 */
+  /* 重复 id 只存一份，且首个出现的 tag 生效。 */
   uchar dup[ 4UL ][ 32UL ];
   memcpy( dup[ 0 ], ids[ 0 ], 32UL );
   memcpy( dup[ 1 ], ids[ 3 ], 32UL );
   memcpy( dup[ 2 ], ids[ 0 ], 32UL );
   memcpy( dup[ 3 ], ids[ 3 ], 32UL );
-  FD_TEST( fd_arbfilter_prog_set( f, 4UL, (uchar const (*)[32UL])dup )==0 );
+  uchar dup_tags[ 4UL ] = { 5U, 6U, 7U, 8U };
+  FD_TEST( fd_arbfilter_prog_set( f, 4UL, (uchar const (*)[32UL])dup, dup_tags )==0 );
   ver = test_check_version( f, ver );
   FD_TEST( f->prog_cnt==2UL );
-  FD_TEST( fd_arbfilter_prog_idx( f, ids[ 0 ] )!=ULONG_MAX );
-  FD_TEST( fd_arbfilter_prog_idx( f, ids[ 3 ] )!=ULONG_MAX );
+  ulong dup_slot0 = fd_arbfilter_prog_idx( f, ids[ 0 ] );
+  ulong dup_slot3 = fd_arbfilter_prog_idx( f, ids[ 3 ] );
+  FD_TEST( dup_slot0!=ULONG_MAX );
+  FD_TEST( dup_slot3!=ULONG_MAX );
+  FD_TEST( f->prog[ dup_slot0 ].tag==5U );
+  FD_TEST( f->prog[ dup_slot3 ].tag==6U );
   FD_TEST( fd_arbfilter_prog_idx( f, ids[ 1 ] )==ULONG_MAX );
 
+  /* tag 随表项落位：装到条目上限后每个成员槽里的 tag 都是它自己的那个。
+     fd_arbfilter_prog_idx 给出的槽号就是要读 tag 的那个槽。 */
+  uchar tags[ FD_ARBFILTER_PROG_ENTRY_MAX ];
+  for( ulong i=0UL; i<FD_ARBFILTER_PROG_ENTRY_MAX; i++ ) tags[ i ] = (uchar)( 3UL*i+1UL );
+  FD_TEST( fd_arbfilter_prog_set( f, FD_ARBFILTER_PROG_ENTRY_MAX, (uchar const (*)[32UL])ids, tags )==0 );
+  ver = test_check_version( f, ver );
+  FD_TEST( f->prog_cnt==FD_ARBFILTER_PROG_ENTRY_MAX );
+  for( ulong i=0UL; i<FD_ARBFILTER_PROG_ENTRY_MAX; i++ ) {
+    ulong slot = fd_arbfilter_prog_idx( f, ids[ i ] );
+    FD_TEST( slot!=ULONG_MAX );
+    FD_TEST( f->prog[ slot ].tag==tags[ i ] );
+  }
+
+  /* tags 为 NULL 时所有表项的 tag 都是 0。 */
+  FD_TEST( fd_arbfilter_prog_set( f, FD_ARBFILTER_PROG_ENTRY_MAX, (uchar const (*)[32UL])ids, NULL )==0 );
+  ver = test_check_version( f, ver );
+  for( ulong i=0UL; i<FD_ARBFILTER_PROG_ENTRY_MAX; i++ ) {
+    ulong slot = fd_arbfilter_prog_idx( f, ids[ i ] );
+    FD_TEST( slot!=ULONG_MAX );
+    FD_TEST( !f->prog[ slot ].tag );
+  }
+
   /* 整表替换成单项：旧成员立刻失效。 */
-  FD_TEST( fd_arbfilter_prog_set( f, 1UL, (uchar const (*)[32UL])&ids[ 5 ] )==0 );
+  FD_TEST( fd_arbfilter_prog_set( f, 1UL, (uchar const (*)[32UL])&ids[ 5 ], NULL )==0 );
   ver = test_check_version( f, ver );
   FD_TEST( f->prog_cnt==1UL );
   FD_TEST( fd_arbfilter_prog_idx( f, ids[ 5 ] )!=ULONG_MAX );
   FD_TEST( fd_arbfilter_prog_idx( f, ids[ 6 ] )==ULONG_MAX );
 
   /* 清空。 */
-  FD_TEST( fd_arbfilter_prog_set( f, 0UL, NULL )==0 );
+  FD_TEST( fd_arbfilter_prog_set( f, 0UL, NULL, NULL )==0 );
   ver = test_check_version( f, ver );
   FD_TEST( f->prog_cnt==0UL );
   FD_TEST( fd_arbfilter_prog_idx( f, ids[ 5 ] )==ULONG_MAX );
@@ -147,28 +174,33 @@ test_acct_set( void * mem ) {
 
   /* 少量热账户：全部命中，未列出的 key 不命中。 */
   ulong cnt = 64UL;
-  FD_TEST( fd_arbfilter_acct_set( f, cnt, (uchar const (*)[32UL])keys )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, cnt, (uchar const (*)[32UL])keys, NULL )==0 );
   ver = test_check_version( f, ver );
   FD_TEST( f->acct_cnt==cnt );
   for( ulong i=0UL; i<cnt; i++ ) FD_TEST( fd_arbfilter_acct_idx( f, keys[ i ] )!=ULONG_MAX );
   for( ulong i=cnt; i<cnt+64UL; i++ ) FD_TEST( fd_arbfilter_acct_idx( f, keys[ i ] )==ULONG_MAX );
 
-  /* 重复 key 只存一份。 */
+  /* 重复 key 只存一份，且首个出现的 tag 生效。 */
   uchar dup[ 4UL ][ 32UL ];
   memcpy( dup[ 0 ], keys[ 0 ], 32UL );
   memcpy( dup[ 1 ], keys[ 7 ], 32UL );
   memcpy( dup[ 2 ], keys[ 0 ], 32UL );
   memcpy( dup[ 3 ], keys[ 7 ], 32UL );
-  FD_TEST( fd_arbfilter_acct_set( f, 4UL, (uchar const (*)[32UL])dup )==0 );
+  uchar dup_tags[ 4UL ] = { 11U, 12U, 13U, 14U };
+  FD_TEST( fd_arbfilter_acct_set( f, 4UL, (uchar const (*)[32UL])dup, dup_tags )==0 );
   ver = test_check_version( f, ver );
   FD_TEST( f->acct_cnt==2UL );
-  FD_TEST( fd_arbfilter_acct_idx( f, keys[ 0 ] )!=ULONG_MAX );
-  FD_TEST( fd_arbfilter_acct_idx( f, keys[ 7 ] )!=ULONG_MAX );
+  ulong dup_slot0 = fd_arbfilter_acct_idx( f, keys[ 0 ] );
+  ulong dup_slot7 = fd_arbfilter_acct_idx( f, keys[ 7 ] );
+  FD_TEST( dup_slot0!=ULONG_MAX );
+  FD_TEST( dup_slot7!=ULONG_MAX );
+  FD_TEST( f->acct[ dup_slot0 ].tag==11U );
+  FD_TEST( f->acct[ dup_slot7 ].tag==12U );
   FD_TEST( fd_arbfilter_acct_idx( f, keys[ 1 ] )==ULONG_MAX );
 
   /* 边界：装到条目上限。装载率因此只有 0.5，所有成员仍然命中，表外的
      key 在走完它所在的那条探测链之后判为未命中。 */
-  FD_TEST( fd_arbfilter_acct_set( f, FD_ARBFILTER_ACCT_ENTRY_MAX, (uchar const (*)[32UL])keys )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, FD_ARBFILTER_ACCT_ENTRY_MAX, (uchar const (*)[32UL])keys, NULL )==0 );
   ver = test_check_version( f, ver );
   FD_TEST( f->acct_cnt==FD_ARBFILTER_ACCT_ENTRY_MAX );
   for( ulong i=0UL; i<FD_ARBFILTER_ACCT_ENTRY_MAX; i++ ) FD_TEST( fd_arbfilter_acct_idx( f, keys[ i ] )!=ULONG_MAX );
@@ -176,13 +208,32 @@ test_acct_set( void * mem ) {
   test_key( absent, FD_ARBFILTER_ACCT_ENTRY_MAX+17UL, 11U );
   FD_TEST( fd_arbfilter_acct_idx( f, absent )==ULONG_MAX );
 
+  /* tag 随表项落位：整表带 tags 安装后每个槽里的 tag 就是它自己的那个；tags
+     为 NULL 时全部为 0。 */
+  uchar tags[ FD_ARBFILTER_ACCT_ENTRY_MAX ];
+  for( ulong i=0UL; i<FD_ARBFILTER_ACCT_ENTRY_MAX; i++ ) tags[ i ] = (uchar)( (7UL*i+3UL) & 0xFFUL );
+  FD_TEST( fd_arbfilter_acct_set( f, FD_ARBFILTER_ACCT_ENTRY_MAX, (uchar const (*)[32UL])keys, tags )==0 );
+  ver = test_check_version( f, ver );
+  for( ulong i=0UL; i<FD_ARBFILTER_ACCT_ENTRY_MAX; i++ ) {
+    ulong slot = fd_arbfilter_acct_idx( f, keys[ i ] );
+    FD_TEST( slot!=ULONG_MAX );
+    FD_TEST( f->acct[ slot ].tag==tags[ i ] );
+  }
+  FD_TEST( fd_arbfilter_acct_set( f, FD_ARBFILTER_ACCT_ENTRY_MAX, (uchar const (*)[32UL])keys, NULL )==0 );
+  ver = test_check_version( f, ver );
+  for( ulong i=0UL; i<FD_ARBFILTER_ACCT_ENTRY_MAX; i++ ) {
+    ulong slot = fd_arbfilter_acct_idx( f, keys[ i ] );
+    FD_TEST( slot!=ULONG_MAX );
+    FD_TEST( !f->acct[ slot ].tag );
+  }
+
   /* 越界：返回 -1 且表保持原样。 */
-  FD_TEST( fd_arbfilter_acct_set( f, FD_ARBFILTER_ACCT_ENTRY_MAX+1UL, (uchar const (*)[32UL])keys )==-1 );
+  FD_TEST( fd_arbfilter_acct_set( f, FD_ARBFILTER_ACCT_ENTRY_MAX+1UL, (uchar const (*)[32UL])keys, NULL )==-1 );
   FD_TEST( f->acct_cnt==FD_ARBFILTER_ACCT_ENTRY_MAX );
   FD_TEST( f->version==ver );
 
   /* 清空。 */
-  FD_TEST( fd_arbfilter_acct_set( f, 0UL, NULL )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, 0UL, NULL, NULL )==0 );
   ver = test_check_version( f, ver );
   FD_TEST( f->acct_cnt==0UL );
   for( ulong i=0UL; i<8UL; i++ ) FD_TEST( fd_arbfilter_acct_idx( f, keys[ i ] )==ULONG_MAX );
@@ -221,8 +272,8 @@ test_match( void * mem ) {
   uchar hot_keys[ 1UL ][ 32UL ];
   memcpy( prog_ids[ 0 ], prog_key,  32UL );
   memcpy( hot_keys[ 0 ],  hot_key,  32UL );
-  FD_TEST( fd_arbfilter_prog_set( f, 1UL, (uchar const (*)[32UL])prog_ids )==0 );
-  FD_TEST( fd_arbfilter_acct_set( f, 1UL, (uchar const (*)[32UL])hot_keys  )==0 );
+  FD_TEST( fd_arbfilter_prog_set( f, 1UL, (uchar const (*)[32UL])prog_ids, NULL )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, 1UL, (uchar const (*)[32UL])hot_keys , NULL )==0 );
 
   /* 每个用例用最小账户列表，只让被测规则成立，避免其它规则顺带命中。 */
 
@@ -331,8 +382,8 @@ test_collect( void * mem ) {
   test_key( hot_key [ 1 ], 63UL, 91U );
   test_key( pad_key,       64UL, 91U );
 
-  FD_TEST( fd_arbfilter_prog_set( f, 2UL, (uchar const (*)[32UL])prog_key )==0 );
-  FD_TEST( fd_arbfilter_acct_set( f, 2UL, (uchar const (*)[32UL])hot_key  )==0 );
+  FD_TEST( fd_arbfilter_prog_set( f, 2UL, (uchar const (*)[32UL])prog_key, NULL )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, 2UL, (uchar const (*)[32UL])hot_key , NULL )==0 );
 
   /* 账户列表：[0]=付款方 [1]=程序成员 [2][3]=热账户 [4]=与 [1] 重复的 key。 */
   fd_acct_addr_t accs[ 5UL ];
@@ -407,8 +458,8 @@ test_collect_commit( void * mem ) {
   uchar hot_key[ 5UL ][ 32UL ];
   test_key( prog_id[ 0 ], 80UL, 93U );
   for( ulong i=0UL; i<5UL; i++ ) test_key( hot_key[ i ], 81UL+i, 93U );
-  FD_TEST( fd_arbfilter_prog_set( f, 1UL, (uchar const (*)[32UL])prog_id )==0 );
-  FD_TEST( fd_arbfilter_acct_set( f, 5UL, (uchar const (*)[32UL])hot_key )==0 );
+  FD_TEST( fd_arbfilter_prog_set( f, 1UL, (uchar const (*)[32UL])prog_id, NULL )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, 5UL, (uchar const (*)[32UL])hot_key, NULL )==0 );
 
   /* 账户列表：[0]=付款方（不在过滤器里）[1]=A [2]=B（只读）[3]=C（没被改动）
      [4]=程序账户 [5]=D（本笔没有 accdb 引用）[6]=E。 */
@@ -480,6 +531,74 @@ test_collect_commit( void * mem ) {
   FD_TEST( !memcmp( hits[ 2 ].key, hot_key[ 4 ], 32UL ) );
 }
 
+/* test_collect_tags 验证命中 key 上的 tag：R1 命中取程序表项的 tag，R3 命中取
+   热账户表项的 tag，两表都命中时取热账户表的 tag、它为 0 时退回程序表的 tag。
+   tag 不参与判定：同样的两张表不带 tag 安装时，位掩码与
+   fd_arbfilter_match 的返回值逐位相同，收集到的 tag 全为 0。 */
+
+static void
+test_collect_tags( void * mem ) {
+  fd_arbfilter_shmem_t * f = fd_arbfilter_join( fd_arbfilter_new( mem ) );
+  FD_TEST( f );
+
+  uchar prog_key[ 3UL ][ 32UL ];
+  uchar acct_key[ 3UL ][ 32UL ];
+  test_key( prog_key[ 0 ], 140UL, 131U ); /* 只在程序表里 */
+  test_key( prog_key[ 1 ], 141UL, 131U ); /* 两表都在，热账户表的 tag 为 0 */
+  test_key( prog_key[ 2 ], 142UL, 131U ); /* 两表都在，热账户表的 tag 非 0 */
+  test_key( acct_key[ 0 ], 143UL, 131U ); /* 只在热账户表里 */
+  memcpy( acct_key[ 1 ], prog_key[ 1 ], 32UL );
+  memcpy( acct_key[ 2 ], prog_key[ 2 ], 32UL );
+
+  uchar prog_tags[ 3UL ] = { 7U, 21U, 30U };
+  uchar acct_tags[ 3UL ] = { 5U,  0U,  9U };
+
+  /* 每个用例只放「付款方 + 一个关注 key」，位掩码只由被测规则决定。 */
+  uchar pad_key[ 32UL ];
+  test_key( pad_key, 144UL, 131U );
+
+  fd_acct_addr_t accs[ 2UL ];
+  memset( accs, 0, sizeof(accs) );
+  memcpy( accs[ 0 ].b, pad_key, 32UL );
+
+  uchar txn_mem[ 512UL ] __attribute__((aligned(alignof(fd_txn_t))));
+  fd_txn_t * txn = test_txn_init( txn_mem, 1UL, 2UL );
+
+  /* case_pid 是顶层指令的 program_id：1 表示账户 1 就是指令直调的程序（R1 成
+     立），0 表示指令调用的是付款方，R1 不成立。 */
+  uchar const * case_key [ 4UL ] = { prog_key[ 0 ], acct_key[ 0 ], prog_key[ 1 ], prog_key[ 2 ] };
+  uchar         case_pid [ 4UL ] = { 1U, 0U, 0U, 0U };
+  ulong         case_bits[ 4UL ] = {
+    FD_ARBFILTER_BIT_PROG_DIRECT |FD_ARBFILTER_BIT_PROG_ACCOUNT,
+    FD_ARBFILTER_BIT_HOT_ACCOUNT,
+    FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT,
+    FD_ARBFILTER_BIT_PROG_ACCOUNT|FD_ARBFILTER_BIT_HOT_ACCOUNT };
+  uchar         case_tag [ 4UL ] = { 7U, 5U, 21U, 9U };
+
+  for( int pass=0; pass<2; pass++ ) {
+    /* pass 0 带 tag 安装，pass 1 不带 tag 安装。 */
+    FD_TEST( fd_arbfilter_prog_set( f, 3UL, (uchar const (*)[32UL])prog_key, pass ? NULL : prog_tags )==0 );
+    FD_TEST( fd_arbfilter_acct_set( f, 3UL, (uchar const (*)[32UL])acct_key, pass ? NULL : acct_tags )==0 );
+
+    for( ulong c=0UL; c<4UL; c++ ) {
+      memcpy( accs[ 1 ].b, case_key[ c ], 32UL );
+      txn->instr[ 0 ].program_id = case_pid[ c ];
+
+      fd_arbfilter_hit_t hits[ 4UL ];
+      ulong              hit_cnt = 0UL;
+      memset( hits, 0xAA, sizeof(hits) );
+
+      ulong bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, 2UL,
+                                        NULL, NULL, NULL, 1, NULL, hits, &hit_cnt, NULL, 4UL );
+      FD_TEST( bits==case_bits[ c ] );
+      FD_TEST( bits==fd_arbfilter_match( f, txn, NULL, (uchar const *)accs, 2UL ) );
+      FD_TEST( hit_cnt==1UL );
+      FD_TEST( hits[ 0 ].tag==( pass ? 0U : case_tag[ c ] ) );
+      FD_TEST( hits[ 1 ].tag==0xAA ); /* 有效条数之外不写 */
+    }
+  }
+}
+
 /* test_collect_parts 验证分片收集：可提交命中超过 hits_cap 时 *more 置 1、
    已发布的索引记进 emitted；用同一份 emitted 再调一次拿到下一片，两片合起
    来覆盖全部可提交命中且不重复。 */
@@ -489,11 +608,12 @@ test_collect_parts( void * mem ) {
   fd_arbfilter_shmem_t * f = fd_arbfilter_join( fd_arbfilter_new( mem ) );
   FD_TEST( f );
 
-  enum { HOT_CNT = 12UL }; /* 大于 FD_ARBNOTIFY_KEY_MAX */
+  /* 10 个可提交热账户命中，一条记录只装得下 8 个：按 8+2 分两片发布。 */
+  enum { HOT_CNT = 10UL };
 
   uchar hot_key[ HOT_CNT ][ 32UL ];
   for( ulong i=0UL; i<HOT_CNT; i++ ) test_key( hot_key[ i ], 100UL+i, 113U );
-  FD_TEST( fd_arbfilter_acct_set( f, HOT_CNT, (uchar const (*)[32UL])hot_key )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, HOT_CNT, (uchar const (*)[32UL])hot_key, NULL )==0 );
 
   fd_acct_addr_t accs[ HOT_CNT+1UL ];
   memset( accs, 0, sizeof(accs) );
@@ -518,7 +638,7 @@ test_collect_parts( void * mem ) {
   FD_TEST( bits==FD_ARBFILTER_BIT_HOT_ACCOUNT );
   FD_TEST( hit_cnt==FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( more==1UL );
-  FD_TEST( emitted==( (1UL<<(FD_ARBNOTIFY_KEY_MAX+1UL))-2UL ) ); /* 索引 1..9 */
+  FD_TEST( emitted==( (1UL<<(FD_ARBNOTIFY_KEY_MAX+1UL))-2UL ) ); /* 索引 1..8 */
 
   ulong seen = 0UL; /* 第 k 位表示 hot_key[k] 已经出现在某一片里 */
   for( ulong i=0UL; i<hit_cnt; i++ ) {
@@ -527,9 +647,9 @@ test_collect_parts( void * mem ) {
     FD_TEST( !( seen & (1UL<<k) ) );
     seen |= 1UL<<k;
   }
-  FD_TEST( seen==( (1UL<<FD_ARBNOTIFY_KEY_MAX)-1UL ) ); /* hot_key[0..8] */
+  FD_TEST( seen==( (1UL<<FD_ARBNOTIFY_KEY_MAX)-1UL ) ); /* hot_key[0..7] */
 
-  /* 第二片：带上第一片的 emitted，只剩后 3 个可提交命中。 */
+  /* 第二片：带上第一片的 emitted，只剩后 2 个可提交命中。 */
   hit_cnt = 0UL;
   more    = 0UL;
   bits = fd_arbfilter_collect( f, txn, NULL, (uchar const *)accs, HOT_CNT+1UL,
@@ -538,7 +658,7 @@ test_collect_parts( void * mem ) {
   FD_TEST( bits==FD_ARBFILTER_BIT_HOT_ACCOUNT );
   FD_TEST( hit_cnt==HOT_CNT-FD_ARBNOTIFY_KEY_MAX );
   FD_TEST( more==0UL );
-  FD_TEST( emitted==( (1UL<<(HOT_CNT+1UL))-2UL ) ); /* 索引 1..12 */
+  FD_TEST( emitted==( (1UL<<(HOT_CNT+1UL))-2UL ) ); /* 索引 1..10 */
 
   for( ulong i=0UL; i<hit_cnt; i++ ) {
     ulong k = test_key_find( (uchar const (*)[32UL])hot_key, HOT_CNT, hits[ i ].key );
@@ -560,16 +680,21 @@ test_collect_parts( void * mem ) {
 }
 
 /* test_notify_fill 验证通知记录的字段落位与截断：part/more 与 key_cnt 按入
-   参落位，key_cnt 与实际写入的条数一致，未用到的 key 槽、填充字节与缺省签
-   名都是确定的 0。 */
+   参落位，key_cnt 与实际写入的条数一致，tag 逐条随 key 抄进 tags[]，未用
+   到的 key 槽与 tag 槽、填充字节与缺省签名都是确定的 0。 */
 
 static void
 test_notify_fill( void ) {
-  FD_TEST( sizeof(fd_arbnotify_t)==384UL );
+  /* 尺寸直接决定 dcache 的槽大小，必须由静态断言钉住；这里再断一次，让运行
+     时也看得见。 */
+  FD_TEST( sizeof(fd_arbnotify_t)==360UL );
   FD_TEST( sizeof(fd_arbnotify_t)%8UL==0UL );
 
   fd_arbfilter_hit_t hits[ FD_ARBNOTIFY_KEY_MAX+2UL ];
-  for( ulong i=0UL; i<FD_ARBNOTIFY_KEY_MAX+2UL; i++ ) test_key( hits[ i ].key, 70UL+i, 97U );
+  for( ulong i=0UL; i<FD_ARBNOTIFY_KEY_MAX+2UL; i++ ) {
+    test_key( hits[ i ].key, 70UL+i, 97U );
+    hits[ i ].tag = (uchar)( 20UL*i+3UL );
+  }
 
   uchar sig[ 64UL ];
   for( ulong i=0UL; i<64UL; i++ ) sig[ i ] = (uchar)i;
@@ -588,18 +713,25 @@ test_notify_fill( void ) {
   FD_TEST( rec->part==2U );
   FD_TEST( rec->more==1U );
   FD_TEST( !memcmp( rec->sig, sig, 64UL ) );
-  for( ulong i=0UL; i<3UL; i++ ) FD_TEST( !memcmp( rec->keys[ i ], hits[ i ].key, 32UL ) );
+  for( ulong i=0UL; i<3UL; i++ ) {
+    FD_TEST( !memcmp( rec->keys[ i ], hits[ i ].key, 32UL ) );
+    FD_TEST( rec->tags[ i ]==hits[ i ].tag );
+  }
 
-  /* fill 先清零整条记录：容量之外的 key 槽与填充字节都是 0。 */
+  /* fill 先清零整条记录：容量之外的 key 槽、tag 槽与填充字节都是 0。 */
   for( ulong i=3UL; i<FD_ARBNOTIFY_KEY_MAX; i++ ) {
     for( ulong j=0UL; j<32UL; j++ ) FD_TEST( !rec->keys[ i ][ j ] );
+    FD_TEST( !rec->tags[ i ] );
   }
   FD_TEST( !rec->_pad );
 
   /* 超过上限只写满 FD_ARBNOTIFY_KEY_MAX 条，key_cnt 报上限。 */
   ret = fd_arbnotify_fill( rec, 1UL, 2UL, (ushort)0U, 0U, (ushort)0x2U, NULL, hits, FD_ARBNOTIFY_KEY_MAX+2UL, 0U, 0U );
   FD_TEST( ret->key_cnt==FD_ARBNOTIFY_KEY_MAX );
-  for( ulong i=0UL; i<FD_ARBNOTIFY_KEY_MAX; i++ ) FD_TEST( !memcmp( rec->keys[ i ], hits[ i ].key, 32UL ) );
+  for( ulong i=0UL; i<FD_ARBNOTIFY_KEY_MAX; i++ ) {
+    FD_TEST( !memcmp( rec->keys[ i ], hits[ i ].key, 32UL ) );
+    FD_TEST( rec->tags[ i ]==hits[ i ].tag );
+  }
 
   /* sig 为 NULL 时签名区写全 0。 */
   for( ulong i=0UL; i<64UL; i++ ) FD_TEST( !rec->sig[ i ] );
@@ -619,11 +751,11 @@ test_probe_bound( void * mem ) {
 
   uchar keys[ FD_ARBFILTER_ACCT_ENTRY_MAX ][ 32UL ];
   for( ulong i=0UL; i<FD_ARBFILTER_ACCT_ENTRY_MAX; i++ ) test_key( keys[ i ], i, 71U );
-  FD_TEST( fd_arbfilter_acct_set( f, FD_ARBFILTER_ACCT_ENTRY_MAX, (uchar const (*)[32UL])keys )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, FD_ARBFILTER_ACCT_ENTRY_MAX, (uchar const (*)[32UL])keys, NULL )==0 );
 
   uchar prog_ids[ FD_ARBFILTER_PROG_ENTRY_MAX ][ 32UL ];
   for( ulong i=0UL; i<FD_ARBFILTER_PROG_ENTRY_MAX; i++ ) test_key( prog_ids[ i ], i, 73U );
-  FD_TEST( fd_arbfilter_prog_set( f, FD_ARBFILTER_PROG_ENTRY_MAX, (uchar const (*)[32UL])prog_ids )==0 );
+  FD_TEST( fd_arbfilter_prog_set( f, FD_ARBFILTER_PROG_ENTRY_MAX, (uchar const (*)[32UL])prog_ids, NULL )==0 );
 
   /* 热账户表：装载率 0.5。这组 key 实测未命中最多 3 次探测、平均 1.6 次，
      这里把上界定在 8 / 3（扫完整张表需要 2048 次），留出换哈希函数或换
@@ -675,8 +807,8 @@ test_stuck_writer( void * mem ) {
   uchar hot_keys[ 1UL ][ 32UL ];
   test_key( prog_ids[ 0 ], 21UL, 41U );
   test_key( hot_keys[ 0 ],  22UL, 41U );
-  FD_TEST( fd_arbfilter_prog_set( f, 1UL, (uchar const (*)[32UL])prog_ids )==0 );
-  FD_TEST( fd_arbfilter_acct_set( f, 1UL, (uchar const (*)[32UL])hot_keys )==0 );
+  FD_TEST( fd_arbfilter_prog_set( f, 1UL, (uchar const (*)[32UL])prog_ids, NULL )==0 );
+  FD_TEST( fd_arbfilter_acct_set( f, 1UL, (uchar const (*)[32UL])hot_keys, NULL )==0 );
 
   ulong ver = f->version;
   FD_TEST( fd_arbfilter_prog_idx( f, prog_ids[ 0 ] )!=ULONG_MAX );
@@ -707,7 +839,7 @@ static volatile int           test_writer_done;
 static void *
 test_writer_thread( void * arg FD_FN_UNUSED ) {
   test_writer_started = 1;
-  FD_TEST( fd_arbfilter_prog_set( test_writer_filter, 1UL, (uchar const (*)[32UL])test_writer_ids )==0 );
+  FD_TEST( fd_arbfilter_prog_set( test_writer_filter, 1UL, (uchar const (*)[32UL])test_writer_ids, NULL )==0 );
   test_writer_done = 1;
   return NULL;
 }
@@ -768,6 +900,7 @@ main( int     argc,
   test_match_empty    ( mem );
   test_collect        ( mem );
   test_collect_commit ( mem );
+  test_collect_tags   ( mem );
   test_collect_parts  ( mem );
   test_notify_fill    ( );
   test_probe_bound    ( mem );

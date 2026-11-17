@@ -75,14 +75,18 @@ arb_print_filter( fd_arbfilter_shmem_t const * filter ) {
   for( ulong i=0UL; i<FD_ARBFILTER_PROG_SLOT_MAX; i++ ) {
     if( !filter->prog[ i ].used ) continue;
     FD_BASE58_ENCODE_32_BYTES( filter->prog[ i ].key, prog_b58 );
-    printf( "  [%lu] %s\n", i, prog_b58 );
+    printf( "  [%lu] %s", i, prog_b58 );
+    if( filter->prog[ i ].tag ) printf( " tag=%u", (uint)filter->prog[ i ].tag );
+    printf( "\n" );
   }
 
   printf( "accounts  %lu / %lu entries\n", filter->acct_cnt, FD_ARBFILTER_ACCT_ENTRY_MAX );
   for( ulong i=0UL; i<FD_ARBFILTER_ACCT_SLOT_MAX; i++ ) {
     if( !filter->acct[ i ].used ) continue;
     FD_BASE58_ENCODE_32_BYTES( filter->acct[ i ].key, acct_b58 );
-    printf( "  [%lu] %s\n", i, acct_b58 );
+    printf( "  [%lu] %s", i, acct_b58 );
+    if( filter->acct[ i ].tag ) printf( " tag=%u", (uint)filter->acct[ i ].tag );
+    printf( "\n" );
   }
 
   /* 四个计数器分成两组看：stat_emit / stat_skip 按交易互斥累加，恒有
@@ -105,18 +109,55 @@ arb_filter_dump( config_t * config ) {
   arb_print_filter( filter );
 }
 
-/* arb_decode_keys 把 cnt 个 base58 参数解码进 out（out 由调用方分配
-   cnt*32 字节）。任何一条解不出来都直接退出，此时运行中的过滤表还没有被
-   改动。 */
+/* arb_decode_keys 把 cnt 个 `base58` 或 `base58:tag` 参数解码进 out（out 由
+   调用方分配 cnt*32 字节），并把每个参数的 tag 写进 tags[i]（没有后缀时为
+   0）。任何一条解不出来或后缀非法都直接退出，此时运行中的过滤表还没有被改
+   动。
+
+   tag 是 0..255 的十进制数。base58 字母表不含 `:`，因此按 `:` 切分是安全
+   的；空后缀、非数字后缀、超出 0..255 的值与多于一个 `:` 一律报错，禁止猜
+   测调用方想表达什么。 */
 
 static void
 arb_decode_keys( char const * const * vals,
                  ulong                cnt,
                  uchar                (*out)[ 32UL ],
+                 uchar *              tags,
                  char const *         flag ) {
   for( ulong i=0UL; i<cnt; i++ ) {
-    if( FD_UNLIKELY( !fd_base58_decode_32( vals[ i ], out[ i ] ) ) )
-      FD_LOG_ERR(( "%s: invalid base58 public key `%s`", flag, vals[ i ] ));
+    char const * val   = vals[ i ];
+    char const * colon = strchr( val, ':' );
+
+    /* 只用 `:` 之前的部分解码：fd_base58_decode_32 要求以 nul 结尾的字符串，
+       因此先拷进栈上缓冲区。 */
+    ulong key_len = colon ? (ulong)( colon-val ) : strlen( val );
+    if( FD_UNLIKELY( key_len>=FD_BASE58_ENCODED_32_SZ ) )
+      FD_LOG_ERR(( "%s: invalid base58 public key `%s`", flag, val ));
+
+    char encoded[ FD_BASE58_ENCODED_32_SZ ];
+    memcpy( encoded, val, key_len );
+    encoded[ key_len ] = '\0';
+    if( FD_UNLIKELY( !fd_base58_decode_32( encoded, out[ i ] ) ) )
+      FD_LOG_ERR(( "%s: invalid base58 public key `%s`", flag, val ));
+
+    tags[ i ] = 0U;
+    if( !colon ) continue;
+
+    char const * suffix = colon+1;
+    if( FD_UNLIKELY( !*suffix ) )
+      FD_LOG_ERR(( "%s: `%s` has an empty tag", flag, val ));
+    if( FD_UNLIKELY( strchr( suffix, ':' ) ) )
+      FD_LOG_ERR(( "%s: `%s` has more than one tag separator", flag, val ));
+
+    ulong tag = 0UL;
+    for( char const * p=suffix; *p; p++ ) {
+      if( FD_UNLIKELY( *p<'0' || *p>'9' ) )
+        FD_LOG_ERR(( "%s: `%s` tag `%s` is not a decimal number", flag, val, suffix ));
+      tag = tag*10UL + (ulong)( *p-'0' );
+      if( FD_UNLIKELY( tag>255UL ) )
+        FD_LOG_ERR(( "%s: `%s` tag `%s` must be in 0..255", flag, val, suffix ));
+    }
+    tags[ i ] = (uchar)tag;
   }
 }
 
@@ -126,18 +167,23 @@ arb_filter_set( args_t *   args,
   if( FD_UNLIKELY( !args->arb.prog_cnt && !args->arb.acct_cnt ) )
     FD_LOG_ERR(( "filter-set requires at least one --prog or --acct" ));
 
-  /* 命令行只记 base58 指针，解码在这里做：失败时两张表都还没动。 */
-  uchar (*prog_ids)[ 32UL ] = NULL;
+  /* 命令行只记 base58 指针，解码与 tag 解析在这里做：失败时两张表都还没
+     动。 */
+  uchar (*prog_ids )[ 32UL ] = NULL;
   uchar (*acct_keys)[ 32UL ] = NULL;
+  uchar * prog_tags = NULL;
+  uchar * acct_tags = NULL;
   if( args->arb.prog_cnt ) {
-    prog_ids = (uchar (*)[32UL])malloc( args->arb.prog_cnt*32UL );
-    if( FD_UNLIKELY( !prog_ids ) ) FD_LOG_ERR(( "out of memory" ));
-    arb_decode_keys( args->arb.prog, args->arb.prog_cnt, prog_ids, "--prog" );
+    prog_ids  = (uchar (*)[32UL])malloc( args->arb.prog_cnt*32UL );
+    prog_tags = (uchar *)malloc( args->arb.prog_cnt );
+    if( FD_UNLIKELY( !prog_ids || !prog_tags ) ) FD_LOG_ERR(( "out of memory" ));
+    arb_decode_keys( args->arb.prog, args->arb.prog_cnt, prog_ids, prog_tags, "--prog" );
   }
   if( args->arb.acct_cnt ) {
     acct_keys = (uchar (*)[32UL])malloc( args->arb.acct_cnt*32UL );
-    if( FD_UNLIKELY( !acct_keys ) ) FD_LOG_ERR(( "out of memory" ));
-    arb_decode_keys( args->arb.acct, args->arb.acct_cnt, acct_keys, "--acct" );
+    acct_tags = (uchar *)malloc( args->arb.acct_cnt );
+    if( FD_UNLIKELY( !acct_keys || !acct_tags ) ) FD_LOG_ERR(( "out of memory" ));
+    arb_decode_keys( args->arb.acct, args->arb.acct_cnt, acct_keys, acct_tags, "--acct" );
   }
 
   fd_arbfilter_shmem_t * filter = arb_join_filter( config, FD_SHMEM_JOIN_MODE_READ_WRITE );
@@ -146,11 +192,11 @@ arb_filter_set( args_t *   args,
      程序 id 与配置热账户互不干扰。exec tile 可以在替换期间继续匹配，
      读到写入中的表时按未命中处理。 */
   if( args->arb.prog_cnt ) {
-    if( FD_UNLIKELY( fd_arbfilter_prog_set( filter, args->arb.prog_cnt, (uchar const (*)[32UL])prog_ids ) ) )
+    if( FD_UNLIKELY( fd_arbfilter_prog_set( filter, args->arb.prog_cnt, (uchar const (*)[32UL])prog_ids, prog_tags ) ) )
       FD_LOG_ERR(( "failed to install %lu program ids", args->arb.prog_cnt ));
   }
   if( args->arb.acct_cnt ) {
-    if( FD_UNLIKELY( fd_arbfilter_acct_set( filter, args->arb.acct_cnt, (uchar const (*)[32UL])acct_keys ) ) )
+    if( FD_UNLIKELY( fd_arbfilter_acct_set( filter, args->arb.acct_cnt, (uchar const (*)[32UL])acct_keys, acct_tags ) ) )
       FD_LOG_ERR(( "failed to install %lu hot accounts", args->arb.acct_cnt ));
   }
 
@@ -158,7 +204,9 @@ arb_filter_set( args_t *   args,
   printf( "programs  %lu / %lu entries\n", filter->prog_cnt, FD_ARBFILTER_PROG_ENTRY_MAX );
   printf( "accounts  %lu / %lu entries\n", filter->acct_cnt, FD_ARBFILTER_ACCT_ENTRY_MAX );
 
+  free( acct_tags );
   free( acct_keys );
+  free( prog_tags );
   free( prog_ids );
 }
 
@@ -327,6 +375,24 @@ typedef struct {
   ulong                  skipped; /* 因为落后被覆盖掉的记录条数 */
 } arb_watch_ring_t;
 
+/* arb_watch_check_rec_sz 用 props 里记录的记录尺寸校验本进程编译进来的
+   fd_arbnotify_t：记录是定长裸布局，尺寸不符说明 `arb` 与运行中的验证器来自
+   不同的构建，此时字段偏移与 key 容量都不可信，禁止按自己的布局硬解记录。 */
+
+static void
+arb_watch_check_rec_sz( fd_topo_t *  topo,
+                        char const * link_name ) {
+  ulong rec_sz = fd_pod_queryf_ulong( topo->props, ULONG_MAX, "%s.rec_sz", link_name );
+  if( FD_UNLIKELY( rec_sz==ULONG_MAX ) )
+    FD_LOG_ERR(( "`%s.rec_sz` not found in the topology properties, the running validator was built "
+                 "before hit records carried a layout size; rebuild `%s` from the same source tree",
+                 link_name, FD_BINARY_NAME ));
+  if( FD_UNLIKELY( rec_sz!=sizeof(fd_arbnotify_t) ) )
+    FD_LOG_ERR(( "`%s` records are %lu bytes in the running validator but %lu bytes in this binary: "
+                 "incompatible versions, rebuild `%s` from the same source tree as the validator",
+                 link_name, rec_sz, (ulong)sizeof(fd_arbnotify_t), FD_BINARY_NAME ));
+}
+
 /* arb_watch_ring_add 按拓扑 props 里的对象 id 把一条 link 的全部实例（每个
    执行 tile 一条）加进 rings。 */
 
@@ -367,9 +433,9 @@ arb_watch_ring_add( fd_topo_t *        topo,
   }
 }
 
-/* arb_watch_print 打印一条记录里的第 key_idx 个 key；--keys-only 时不读账户
-   数据。账户从记录自带的 fork 读，因此读到的是那笔交易执行时看到的那条
-   链上的账户。 */
+/* arb_watch_print 打印一条记录里的第 key_idx 个 key 与它的 tag；--keys-only
+   时不读账户数据。账户从记录自带的 fork 读，因此读到的是那笔交易执行时看到
+   的那条链上的账户。tag 为 0（表项没有 tag）时省略，输出与不带 tag 时相同。 */
 
 static void
 arb_watch_print( arb_accdb_ro_t *       ro,
@@ -381,6 +447,7 @@ arb_watch_print( arb_accdb_ro_t *       ro,
   printf( "slot=%lu bank=%lu fork=%u part=%u more=%u bits=0x%x key=%s",
           rec->slot, rec->bank_seq, (uint)rec->accdb_fork_id,
           (uint)rec->part, (uint)rec->more, (uint)rec->matched, key_b58 );
+  if( rec->tags[ key_idx ] ) printf( " tag=%u", (uint)rec->tags[ key_idx ] );
 
   if( arb_watch_keys_only ) { printf( "\n" ); return; }
 
@@ -410,6 +477,10 @@ arb_watch( config_t * config ) {
   /* 过滤器与两条环都在 `arbfilter` 工作区：映射一次就够，顺带确认对象
      布局来自运行中的验证器。 */
   (void)arb_join_filter( config, FD_SHMEM_JOIN_MODE_READ_ONLY );
+
+  /* 解读记录之前必须确认两边的记录尺寸一致，禁止按本进程的布局硬解。 */
+  arb_watch_check_rec_sz( topo, FD_ARBNOTIFY_LINK_LE );
+  arb_watch_check_rec_sz( topo, FD_ARBNOTIFY_LINK_RP );
 
   arb_watch_ring_t rings[ ARB_WATCH_RING_MAX ];
   ulong ring_cnt = 0UL;
@@ -511,7 +582,8 @@ arb_cmd_args( int *    pargc,
   /* 位置参数按出现顺序取：先是子命令，`account` 再带一个 base58 地址。
      --prog 与 --acct 可重复，因此不能用 fd_env_strip_cmdline_* 剥离
      （它只保留最后一个值），这里自己扫一遍并压实 argv，剩下的未知参数
-     留给 fd_main 报错。base58 只记指针，由命令自己解码。
+     留给 fd_main 报错。base58 与可选的 `:tag` 后缀只记指针，由命令自己解
+     码与解析。
      --limit 与 --keys-only 只属于 `watch`，同样在这里剥离。 */
   int new_argc = 0;
   for( int i=0; i<*pargc; i++ ) {
@@ -561,8 +633,8 @@ arb_args_help( fd_action_help_t * help ) {
   fd_action_help_arg( help, "filter-set",  NULL, "Replace the program id set and/or the hot account table" );
   fd_action_help_arg( help, "account",     "<address>", "Read one account out of the running validator's accdb" );
   fd_action_help_arg( help, "watch",       NULL, "Consume the arbitrage hit rings and read the hit accounts" );
-  fd_action_help_arg( help, "--prog", "<address>", "Program id to add to the filter (repeatable, replaces the whole set)" );
-  fd_action_help_arg( help, "--acct", "<address>", "Hot account key to add to the filter (repeatable, replaces the whole table)" );
+  fd_action_help_arg( help, "--prog", "<address>[:tag]", "Program id to add to the filter (repeatable, replaces the whole set)" );
+  fd_action_help_arg( help, "--acct", "<address>[:tag]", "Hot account key to add to the filter (repeatable, replaces the whole table)" );
   fd_action_help_arg( help, "--limit", "<n>", "watch: stop after n records (default: run until killed)" );
   fd_action_help_arg( help, "--keys-only", NULL, "watch: print the hits without reading any account data" );
 }
@@ -579,13 +651,17 @@ action_t fd_action_arb = {
                     "\n"
                     "  filter-dump                   print the configured program ids, hot accounts\n"
                     "                                and the emit/skip/published counters\n"
-                    "  filter-set --prog <a> ...     replace the program id set (DEX programs)\n"
-                    "             --acct <a> ...     replace the hot account table (pool accounts)\n"
+                    "  filter-set --prog <a>[:tag]   replace the program id set (DEX programs)\n"
+                    "             --acct <a>[:tag]   replace the hot account table (pool accounts)\n"
                     "  account <address>             print lamports, owner, executable and data of\n"
                     "                                one account at the current root fork\n"
                     "  watch [--limit <n>] [--keys-only]\n"
                     "                                consume the arb_notify / arb_notify_rp rings and\n"
                     "                                read every hit key out of the accdb\n"
+                    "\n"
+                    "The optional `:tag` suffix on --prog / --acct attaches a 1-byte tag\n"
+                    "(0..255) to that entry.  Tags are published with every hit key and never\n"
+                    "affect whether a transaction matches.\n"
                     "\n"
                     "filter-set takes effect immediately; exec tiles keep matching while the tables\n"
                     "are replaced.  filter-dump and account read only.  watch is a reference\n"

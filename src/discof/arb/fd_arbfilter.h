@@ -26,8 +26,11 @@
 
 #include "../../ballet/txn/fd_txn.h"
 
-/* FD_ARBFILTER_MAGIC 标识一个已格式化的 arbfilter 内存区域。 */
-#define FD_ARBFILTER_MAGIC (0x415242464C545231UL) /* "ARBFLTR1" */
+/* FD_ARBFILTER_MAGIC 标识一个已格式化的 arbfilter 内存区域。结尾的数字是
+   内存布局版本：只要结构体布局发生变化（表项加字段、计数器增删等）就必须
+   把版本号加一，否则新二进制 join 旧验证器的共享内存时校验会通过，而按新
+   布局解读旧数据会静默错位。当前版本对应 fd_arbfilter_ent 带 tag 字段。 */
+#define FD_ARBFILTER_MAGIC (0x415242464C545232UL) /* "ARBFLTR2" */
 
 /* FD_ARBFILTER_ALIGN 是 arbfilter 内存区域的对齐要求。 */
 
@@ -41,8 +44,8 @@
    的期望探测次数约为 (1+1/(1-α)^2)/2，α=0.5 时约 2.5 次，α=1.0 时要扫完
    整张表。热路径上绝大多数交易是未命中，所以上限必须钉在 0.5。
 
-   程序表 128 槽 / 64 条目，整张表 4 KiB；热账户表 2048 槽 / 1024 条目，
-   约 66 KiB，常驻 L2。 */
+   程序表 128 槽 / 64 条目，整张表约 4.25 KiB；热账户表 2048 槽 / 1024
+   条目，约 68 KiB，常驻 L2。 */
 
 #define FD_ARBFILTER_PROG_SLOT_MAX  (128UL)  /* 槽数，必须是 2 的幂 */
 #define FD_ARBFILTER_PROG_ENTRY_MAX (64UL)   /* 可配置的程序 id 上限 */
@@ -61,19 +64,26 @@
 #define FD_ARBFILTER_BIT_PROG_ACCOUNT (2UL) /* R2：过滤器中的程序出现在账户列表里 */
 #define FD_ARBFILTER_BIT_HOT_ACCOUNT (4UL) /* R3：触及了热池账户 */
 
-/* fd_arbfilter_hit_t 是一个命中的 key。fd_arbfilter_collect 把会被提交进
-   bank 的命中 key 按判定顺序去重后写进这种元素的数组，调用方据此把 key
-   发布给下游。 */
+/* fd_arbfilter_hit_t 是一个命中的 key 与它所在表项的 tag。fd_arbfilter_collect
+   把会被提交进 bank 的命中 key 按判定顺序去重后写进这种元素的数组，调用方
+   据此把 key 与 tag 发布给下游。
+
+   tag 只随记录发布，不参与任何判定：同一个 key 无论 tag 是什么，命中结论与
+   位掩码都相同。 */
 
 typedef struct {
   uchar key[ 32UL ];
+  uchar tag;
 } fd_arbfilter_hit_t;
 
-/* fd_arbfilter_ent 是一张 key 表里的一个槽：32 字节 key 加一个占用标志。
-   两张表共用这个元素类型，探测逻辑因此只需要写一份。 */
+/* fd_arbfilter_ent 是一张 key 表里的一个槽：32 字节 key、一个可选 tag 与一个
+   占用标志。两张表共用这个元素类型，探测逻辑因此只需要写一份。
 
+   tag 由安装表的一方给出，0 表示未设置。它不参与探测与判定，只在命中时随
+   该表项的 key 一起发布出去。 */
 struct fd_arbfilter_ent {
   uchar key[ 32UL ];
+  uchar tag;
   uchar used;
 };
 
@@ -185,24 +195,28 @@ fd_arbfilter_shmem_t *
 fd_arbfilter_join( void * shmem );
 
 /* fd_arbfilter_prog_set 用 cnt 个程序 id 重建程序表
-   （cnt<=FD_ARBFILTER_PROG_ENTRY_MAX）。重复的 id 只存一份。成功返回 0；cnt
-   越界时返回 -1，此时表保持原样。在 exec tile 执行交易期间调用是安全的。
+   （cnt<=FD_ARBFILTER_PROG_ENTRY_MAX）。tags 是 cnt 个与 ids 逐条对应的 tag，
+   NULL 表示全部为 0。重复的 id 只存一份，且首个出现的 tag 生效。成功返回 0；
+   cnt 越界时返回 -1，此时表保持原样。在 exec tile 执行交易期间调用是安全的。
    写方之间用序号的 CAS 互斥，并发调用不会让两张表交错写入。 */
 
 int
 fd_arbfilter_prog_set( fd_arbfilter_shmem_t * f,
                        ulong                  cnt,
-                       uchar const            (*ids)[ 32UL ] );
+                       uchar const            (*ids)[ 32UL ],
+                       uchar const *          tags );
 
 /* fd_arbfilter_acct_set 用 cnt 个 key 重建热账户表
-   （cnt<=FD_ARBFILTER_ACCT_ENTRY_MAX）。重复的 key 只存一份。成功返回 0；
+   （cnt<=FD_ARBFILTER_ACCT_ENTRY_MAX）。tags 是 cnt 个与 keys 逐条对应的 tag，
+   NULL 表示全部为 0。重复的 key 只存一份，且首个出现的 tag 生效。成功返回 0；
    cnt 越界时返回 -1，此时表保持原样。在 exec tile 执行交易期间调用是
    安全的。 */
 
 int
 fd_arbfilter_acct_set( fd_arbfilter_shmem_t * f,
                        ulong                  cnt,
-                       uchar const            (*keys)[ 32UL ] );
+                       uchar const            (*keys)[ 32UL ],
+                       uchar const *          tags );
 
 /* fd_arbfilter_prog_idx 返回 key 在程序表中的槽号；key 不在表中，或者
    整个重试预算内都撞上并发替换时返回 ULONG_MAX。查询是 O(1) 次探测：
@@ -220,20 +234,23 @@ ulong
 fd_arbfilter_acct_idx( fd_arbfilter_shmem_t const * f,
                        uchar const *                key );
 
-/* arbfilter_hit_push 把 key 追加到 hits[0..*hit_cnt) 的尾部。已经在这个
-   前缀里的 key 不重复写入，因此同一笔交易反复触到同一个 key 时只留一份。
-   hits_cap 用尽后新 key 直接丢弃：截断只影响 key 列表，不影响匹配结论。
-   调用方 arbfilter_hit_take 在调用前已经确认还有空位。 */
+/* arbfilter_hit_push 把 key 与它的 tag 追加到 hits[0..*hit_cnt) 的尾部。已经
+   在这个前缀里的 key 不重复写入，因此同一笔交易反复触到同一个 key 时只留
+   一份，tag 随它第一次出现时的那份。hits_cap 用尽后新 key 直接丢弃：截断只
+   影响 key 列表，不影响匹配结论。调用方 arbfilter_hit_take 在调用前已经确认
+   还有空位。 */
 
 static inline void
 arbfilter_hit_push( fd_arbfilter_hit_t * hits,
                     ulong *              hit_cnt,
                     ulong                hits_cap,
-                    uchar const *        key ) {
+                    uchar const *        key,
+                    uchar                tag ) {
   ulong cnt = *hit_cnt;
   for( ulong i=0UL; i<cnt; i++ ) if( FD_UNLIKELY( fd_memeq( hits[ i ].key, key, 32UL ) ) ) return;
   if( FD_UNLIKELY( cnt>=hits_cap ) ) return;
   fd_memcpy( hits[ cnt ].key, key, 32UL );
+  hits[ cnt ].tag = tag;
   *hit_cnt = cnt+1UL;
 }
 
@@ -272,9 +289,9 @@ arbfilter_emitted_set( ulong * emitted,
   if( emitted && i<64UL ) *emitted |= 1UL<<i;
 }
 
-/* arbfilter_hit_take 把一个可提交的命中 key 收进本片：已经发布过的索引跳
-   过；本片已满时置 *more 并把该索引留给下一片；否则去重写入并置位索引。
-   位掩码与这里无关，调用方只在命中且满足提交判据时才调用。 */
+/* arbfilter_hit_take 把一个可提交的命中 key 与它的 tag 收进本片：已经发布过
+   的索引跳过；本片已满时置 *more 并把该索引留给下一片；否则去重写入并置位
+   索引。位掩码与这里无关，调用方只在命中且满足提交判据时才调用。 */
 
 static inline void
 arbfilter_hit_take( fd_arbfilter_hit_t * hits,
@@ -283,6 +300,7 @@ arbfilter_hit_take( fd_arbfilter_hit_t * hits,
                     ulong *              emitted,
                     ulong                i,
                     uchar const *        key,
+                    uchar                tag,
                     ulong *              more ) {
   /* 位图只有 64 位：索引装不下的账户既测不到也置不上，必须直接跳过。否则
      这类索引每一片都会被当成「未发布」，*more 永远为 1，调用方的分片循环
@@ -290,7 +308,7 @@ arbfilter_hit_take( fd_arbfilter_hit_t * hits,
   if( FD_UNLIKELY( i>=64UL ) ) return;
   if( arbfilter_emitted_test( emitted, i ) ) return;
   if( FD_UNLIKELY( *hit_cnt>=hits_cap ) ) { if( more ) *more = 1UL; return; }
-  arbfilter_hit_push( hits, hit_cnt, hits_cap, key );
+  arbfilter_hit_push( hits, hit_cnt, hits_cap, key, tag );
   arbfilter_emitted_set( emitted, i );
 }
 
@@ -315,9 +333,12 @@ arbfilter_hit_take( fd_arbfilter_hit_t * hits,
    只有 commit_ok && writable[i] && touched[i] && acquired[i] 的命中账户才进
    hits。任一掩码为 NULL 时该维度不设限，供纯判定与单测使用。命中但不满足
    提交判据的账户不收集，位掩码不受影响。
+   hits 按判定顺序接收命中 key 与它的 tag，去重，最多写 hits_cap 条，实际条
+   数写进 *hit_cnt；hits 为 NULL 时既不读也不写 hit_cnt，此时本函数就是纯判
+   定。tag 取表项上的 tag：R1 与 R2 命中取程序表项，R3 命中取热账户表项；同
+   一个 key 同时命中两张表时取热账户表的 tag，该 tag 为 0 时退回程序表的
+   tag。tag 不参与判定，位掩码与返回值不受它影响。
 
-   hits 按判定顺序接收命中 key，去重，最多写 hits_cap 条，实际条数写进
-   *hit_cnt；hits 为 NULL 时既不读也不写 hit_cnt，此时本函数就是纯判定。
    emitted 是 64 位已发布索引位图：分片发布时调用方传同一份，已置位的索引
    本片跳过，因此分片之间不重复；acc_cnt 必须不超过 64（该位图是一整字）。
    去重只发生在一条记录之内：同一个 key 出现在多个账户下标、而这些下标被分
@@ -357,11 +378,12 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
   for( ulong i=0UL; i<(ulong)txn->instr_cnt; i++ ) {
     ulong prog_idx = (ulong)txn->instr[ i ].program_id;
     if( FD_UNLIKELY( prog_idx>=acc_cnt ) ) continue; /* 交易数据不一致 */
-    uchar const * key = accs + prog_idx*FD_TXN_ACCT_ADDR_SZ;
-    if( FD_UNLIKELY( fd_arbfilter_prog_idx( filter, key )!=ULONG_MAX ) ) {
+    uchar const * key  = accs + prog_idx*FD_TXN_ACCT_ADDR_SZ;
+    ulong         slot = fd_arbfilter_prog_idx( filter, key );
+    if( FD_UNLIKELY( slot!=ULONG_MAX ) ) {
       bits |= FD_ARBFILTER_BIT_PROG_DIRECT;
       if( FD_UNLIKELY( hits && arbfilter_committable( writable, touched, acquired, commit_ok, prog_idx ) ) )
-        arbfilter_hit_take( hits, &cnt, hits_cap, emitted, prog_idx, key, more );
+        arbfilter_hit_take( hits, &cnt, hits_cap, emitted, prog_idx, key, filter->prog[ slot ].tag, more );
       break;
     }
   }
@@ -369,14 +391,21 @@ fd_arbfilter_collect( fd_arbfilter_shmem_t const * filter,
   /* R2/R3：对解析后的账户列表只遍历一遍。 */
   ulong want = FD_ARBFILTER_BIT_PROG_ACCOUNT | FD_ARBFILTER_BIT_HOT_ACCOUNT;
   for( ulong i=0UL; i<acc_cnt; i++ ) {
-    uchar const * key     = accs + i*FD_TXN_ACCT_ADDR_SZ;
-    int           in_prog = fd_arbfilter_prog_idx( filter, key )!=ULONG_MAX;
-    int           in_acct = fd_arbfilter_acct_idx( filter, key )!=ULONG_MAX;
+    uchar const * key       = accs + i*FD_TXN_ACCT_ADDR_SZ;
+    ulong         prog_slot = fd_arbfilter_prog_idx( filter, key );
+    ulong         acct_slot = fd_arbfilter_acct_idx( filter, key );
+    int           in_prog   = prog_slot!=ULONG_MAX;
+    int           in_acct   = acct_slot!=ULONG_MAX;
     if( FD_UNLIKELY( in_prog ) ) bits |= FD_ARBFILTER_BIT_PROG_ACCOUNT;
     if( FD_UNLIKELY( in_acct ) ) bits |= FD_ARBFILTER_BIT_HOT_ACCOUNT;
     if( FD_UNLIKELY( hits && ( in_prog || in_acct ) &&
-                     arbfilter_committable( writable, touched, acquired, commit_ok, i ) ) )
-      arbfilter_hit_take( hits, &cnt, hits_cap, emitted, i, key, more );
+                     arbfilter_committable( writable, touched, acquired, commit_ok, i ) ) ) {
+      /* 两张表都命中时以热账户表的 tag 为准（池账户离套利标的更近）；它
+         的 tag 为 0 时退回程序表的 tag。tag 只在命中之后才读。 */
+      uchar tag = in_acct ? filter->acct[ acct_slot ].tag : 0U;
+      if( !tag && in_prog ) tag = filter->prog[ prog_slot ].tag;
+      arbfilter_hit_take( hits, &cnt, hits_cap, emitted, i, key, tag, more );
+    }
     /* 只有纯判定（hits 为 NULL）时才提前退出：收集 key 的调用方要拿到这
        笔交易触到的全部关注 key，提前退出会让后面的命中丢失。 */
     if( FD_UNLIKELY( !hits && bits==( FD_ARBFILTER_BIT_PROG_DIRECT|want ) ) ) break;

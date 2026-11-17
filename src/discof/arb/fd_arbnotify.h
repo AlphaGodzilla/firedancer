@@ -17,7 +17,7 @@
    提交命中多于这个数时按片发布（见 part/more），命中不丢失；matched 位掩
    码始终完整。 */
 
-#define FD_ARBNOTIFY_KEY_MAX (9UL)
+#define FD_ARBNOTIFY_KEY_MAX (8UL)
 
 struct fd_arbnotify {
   ulong  slot;             /* 交易所在 slot */
@@ -31,16 +31,23 @@ struct fd_arbnotify {
   uchar  _pad;
   uchar  sig[ 64 ];        /* 交易签名，供外部程序对账 */
   uchar  keys[ FD_ARBNOTIFY_KEY_MAX ][ 32 ];
+  uchar  tags[ FD_ARBNOTIFY_KEY_MAX ]; /* 与 keys 一一对应，0 表示无 tag */
 };
 
 typedef struct fd_arbnotify fd_arbnotify_t;
 
 /* 记录的定长决定了 link 的 mtu：mtu 必须直接取 sizeof(fd_arbnotify_t)，
-   禁止在拓扑里另写数字。accdb_fork_id 后面的 2 字节隐式填充、_pad 与尾部
-   填充让 sizeof 落在 384，与 dcache 按 128 字节对齐后的槽大小相同，因此环
-   内存不随每条记录携带的 key 条数变化。 */
+   禁止在拓扑里另写数字。
 
-FD_STATIC_ASSERT( sizeof(fd_arbnotify_t)==384UL, fd_arbnotify_layout );
+   尺寸是 28（定长字段）+ 64（sig）+ 8*32（key）+ 8（tag）= 356，按 8 字节
+   对齐到 360。dcache 的槽按 128 字节对齐，FD_DCACHE_SLOT_FOOTPRINT( 360 )
+   == 384，因此带 tag 的记录与不带 tag 的记录占用同样大的槽，环内存不随每条
+   记录携带的 key 条数与 tag 变化；加 tag 的代价是每片 key 容量从 9 降到 8。
+
+   外部读者必须先用 props 里的 rec_sz 校验本结构体的尺寸再解读记录：记录是
+   定长裸布局，尺寸不一致时字段偏移全部失效。 */
+
+FD_STATIC_ASSERT( sizeof(fd_arbnotify_t)==360UL, fd_arbnotify_layout );
 
 /* FD_ARBNOTIFY_LINK_LE / FD_ARBNOTIFY_LINK_RP 是两个执行 tile 各自的出链
    路名：leader 路径的 execle tile 发布到前者，replay 路径的 execrp tile
@@ -57,9 +64,10 @@ FD_PROTOTYPES_BEGIN
 /* fd_arbnotify_fill 把一条记录写进 rec 并返回 rec。
 
    rec 由调用方从 dcache 取，chunk 已经按 fd_arbnotify_t 对齐。fill 先把
-   整条记录清零，再写各字段与 hits[0..hit_cnt) 的 key，尾部未用到的 key
-   槽与填充字节因此都是确定的 0。hit_cnt 超过 FD_ARBNOTIFY_KEY_MAX 时只写
-   前 FD_ARBNOTIFY_KEY_MAX 条，key_cnt 记录实际写入的条数。
+   整条记录清零，再写各字段与 hits[0..hit_cnt) 的 key 与 tag，尾部未用到的
+   key 槽、tag 槽与填充字节因此都是确定的 0。hit_cnt 超过
+   FD_ARBNOTIFY_KEY_MAX 时只写前 FD_ARBNOTIFY_KEY_MAX 条，key_cnt 记录实际
+   写入的条数，调用方据 part/more 继续发布后续分片。
 
    part 是同一笔交易的第几片（从 0 起），more 为 1 表示该交易还有后续分片：
    可提交命中超过一条记录的容量时，调用方按片发布多条记录，读者据此识别
@@ -93,7 +101,10 @@ fd_arbnotify_fill( fd_arbnotify_t *           rec,
   if( FD_LIKELY( sig ) ) fd_memcpy( rec->sig, sig, 64UL );
 
   ulong cnt = hits ? fd_ulong_min( hit_cnt, FD_ARBNOTIFY_KEY_MAX ) : 0UL;
-  for( ulong i=0UL; i<cnt; i++ ) fd_memcpy( rec->keys[ i ], hits[ i ].key, 32UL );
+  for( ulong i=0UL; i<cnt; i++ ) {
+    fd_memcpy( rec->keys[ i ], hits[ i ].key, 32UL );
+    rec->tags[ i ] = hits[ i ].tag;
+  }
   rec->key_cnt = (uchar)cnt;
 
   return rec;
